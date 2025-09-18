@@ -1,0 +1,110 @@
+name: Build client executables
+
+on:
+  push:
+    tags:
+      - "client-v*.*.*"   # Tag like client-v1.0.0 to trigger
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set variables
+        id: vars
+        run: |
+          echo "APP_NAME=scrapeclient" >> $GITHUB_ENV                 # 👈 CHANGE ME if you want a different binary name
+          echo "ENTRY=client.py" >> $GITHUB_ENV                  # 👈 CHANGE ME if your entry file isn't client.py
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pyinstaller
+
+      - name: Build single-file executable
+        run: |
+          pyinstaller --onefile --name "${APP_NAME}" "${ENTRY}"
+
+      - name: Collect artifacts & checksums
+        shell: bash
+        run: |
+          mkdir -p release
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp "dist/${APP_NAME}.exe" "release/${APP_NAME}-windows-x64.exe"
+            certutil -hashfile "release/${APP_NAME}-windows-x64.exe" SHA256 | tail -n 1 > "release/${APP_NAME}-windows-x64.exe.sha256"
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            cp "dist/${APP_NAME}" "release/${APP_NAME}-macos-arm64"
+            shasum -a 256 "release/${APP_NAME}-macos-arm64" | awk '{print $1}' > "release/${APP_NAME}-macos-arm64.sha256"
+          else
+            cp "dist/${APP_NAME}" "release/${APP_NAME}-linux-x64"
+            sha256sum "release/${APP_NAME}-linux-x64" | awk '{print $1}' > "release/${APP_NAME}-linux-x64.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-artifact
+          path: release/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./collected
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find collected -type f -exec cp {} release/ \;
+
+      - name: Build manifest
+        env:
+          TAG:   ${{ github.ref_name }}                 # e.g. client-v1.0.0
+          OWNER: ${{ github.repository_owner }}         # org/user of this repo
+          REPO:  ${{ github.event.repository.name }}    # repo name (e.g. app-client)
+        run: |
+          VERSION="${TAG#client-v}"
+          # Infer APP_NAME from any artifact (strip suffixes)
+          APP_NAME="$(ls release | head -n1 | sed -E 's/-(windows|linux|macos).*//; s/\..*//')"
+
+          BASE="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}"
+          WIN="${APP_NAME}-windows-x64.exe"
+          MAC="${APP_NAME}-macos-arm64"
+          LIN="${APP_NAME}-linux-x64"
+
+          WIN_SHA="$(cat "release/${WIN}.sha256" || true)"
+          MAC_SHA="$(cat "release/${MAC}.sha256" || true)"
+          LIN_SHA="$(cat "release/${LIN}.sha256" || true)"
+
+          cat > release/client-manifest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "assets": {
+              "windows": { "url": "${BASE}/${WIN}", "sha256": "${WIN_SHA}" },
+              "macos":   { "url": "${BASE}/${MAC}", "sha256": "${MAC_SHA}" },
+              "linux":   { "url": "${BASE}/${LIN}", "sha256": "${LIN_SHA}" }
+            }
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
