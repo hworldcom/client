@@ -12,9 +12,10 @@ defaults:
   run:
     shell: bash
 
+# Change these for your project
 env:
-  APP_NAME: scrapeclient        # ← change to your binary name
-  ENTRY: client.py         # ← change if your entry file differs
+  APP_NAME: scrapeclient        # <- desired binary name
+  ENTRY: client.py         # <- python entry file
 
 jobs:
   build:
@@ -54,51 +55,48 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-22.04
-    env:
-      TAG:   ${{ github.ref_name }}                 # e.g. client-v1.0.3
-      OWNER: ${{ github.repository_owner }}
-      REPO:  ${{ github.event.repository.name }}
-      APP_NAME: ${{ env.APP_NAME }}
+    # no need to mirror APP_NAME here; it's inherited from top-level env
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: ./collected
+
       - name: Flatten artifacts
         run: |
           mkdir -p release
           find collected -type f -exec cp {} release/ \;
           ls -al release
-      - name: Build manifest (Python, no control chars)
+
+      - name: Build manifest (Python, clean checksums)
         run: |
           python3 - <<'PY'
           import os, json, hashlib, pathlib
-          tag   = os.environ["TAG"]              # like client-v1.0.3
-          owner = os.environ["OWNER"]
-          repo  = os.environ["REPO"]
-          app   = os.environ["APP_NAME"]
+          app   = os.environ.get("APP_NAME", "yourapp")
+          tag   = os.environ["GITHUB_REF_NAME"]  # e.g. client-v1.0.3
+          owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+          repo  = os.environ["GITHUB_REPOSITORY"].split("/")[1]
           base  = f"https://github.com/{owner}/{repo}/releases/download/{tag}"
           files = {
             "windows": f"{app}-windows-x64.exe",
             "macos":   f"{app}-macos-arm64",
             "linux":   f"{app}-linux-x64",
           }
-          def sha256(path: pathlib.Path) -> str:
+          def sha256(p: pathlib.Path) -> str:
             h = hashlib.sha256()
-            with path.open("rb") as f:
-              for chunk in iter(lambda: f.read(1<<20), b""):
-                h.update(chunk)
+            with p.open("rb") as f:
+              for chunk in iter(lambda: f.read(1<<20), b""): h.update(chunk)
             return h.hexdigest()
           manifest = {
             "version": tag.removeprefix("client-v"),
             "assets": {
-              k: {"url": f"{base}/{fname}",
-                  "sha256": sha256(pathlib.Path("release")/fname)}
+              k: {"url": f"{base}/{fname}", "sha256": sha256(pathlib.Path("release")/fname)}
               for k, fname in files.items()
             }
           }
           with open("release/client-manifest.json","w",encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False)
           PY
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
