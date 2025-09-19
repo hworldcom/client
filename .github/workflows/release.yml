@@ -76,36 +76,42 @@ jobs:
           mkdir -p release
           find collected -type f -exec cp {} release/ \;
 
-      - name: Build manifest
+      - name: Build manifest (clean checksums)
         env:
-          TAG:   ${{ github.ref_name }}                 # e.g. client-v1.0.0
-          OWNER: ${{ github.repository_owner }}         # org/user of this repo
-          REPO:  ${{ github.event.repository.name }}    # repo name (e.g. app-client)
+          TAG:   ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+          REPO:  ${{ github.event.repository.name }}
           APP_NAME: ${{ env.APP_NAME }}
         run: |
+          set -euo pipefail
           VERSION="${TAG#client-v}"
           BASE="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}"
           WIN="${APP_NAME}-windows-x64.exe"
           MAC="${APP_NAME}-macos-arm64"
           LIN="${APP_NAME}-linux-x64"
 
-          WIN_SHA="$(cat "release/${WIN}.sha256" || true)"
-          MAC_SHA="$(cat "release/${MAC}.sha256" || true)"
-          LIN_SHA="$(cat "release/${LIN}.sha256" || true)"
+          # Helper extracts exactly 64 hex chars and removes CR/LF
+          sha_clean() { grep -oE '[A-Fa-f0-9]{64}' | tr -d '\r\n'; }
 
-          cat > release/client-manifest.json <<EOF
-          {
-            "version": "${VERSION}",
+          WIN_SHA="$(cat "release/${WIN}.sha256" | sha_clean || true)"
+          MAC_SHA="$(cat "release/${MAC}.sha256" | sha_clean || true)"
+          LIN_SHA="$(cat "release/${LIN}.sha256" | sha_clean || true)"
+
+          python3 - <<'PY'
+          import json, os
+          version = os.environ["VERSION"]
+          base = os.environ["BASE"]
+          win = os.environ["WIN"];  win_sha = os.environ.get("WIN_SHA","")
+          mac = os.environ["MAC"];  mac_sha = os.environ.get("MAC_SHA","")
+          lin = os.environ["LIN"];  lin_sha = os.environ.get("LIN_SHA","")
+          manifest = {
+            "version": version,
             "assets": {
-              "windows": { "url": "${BASE}/${WIN}", "sha256": "${WIN_SHA}" },
-              "macos":   { "url": "${BASE}/${MAC}", "sha256": "${MAC_SHA}" },
-              "linux":   { "url": "${BASE}/${LIN}", "sha256": "${LIN_SHA}" }
-            }
+              "windows": {"url": f"{base}/{win}", "sha256": win_sha},
+              "macos":   {"url": f"{base}/{mac}", "sha256": mac_sha},
+              "linux":   {"url": f"{base}/{lin}", "sha256": lin_sha},
+            },
           }
-          EOF
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
+          with open("release/client-manifest.json","w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False)
+          PY
