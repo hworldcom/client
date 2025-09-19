@@ -3,20 +3,18 @@ name: Build client executables
 on:
   push:
     tags:
-      - "client-v*.*.*"   # Tag like client-v1.0.0 to trigger
+      - "client-v*.*.*"   # tag like client-v1.0.3
 
 permissions:
   contents: write
 
-# Use bash on Linux, macOS, and Windows runners
 defaults:
   run:
     shell: bash
 
-# 🔧 Replace these with your names
 env:
-  APP_NAME: scrapeclient          # <- change to the binary name you want
-  ENTRY: client.py           # <- change if your entry file isn't client.py
+  APP_NAME: scrapeclient        # ← change to your binary name
+  ENTRY: client.py         # ← change if your entry file differs
 
 jobs:
   build:
@@ -25,39 +23,29 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, macos-14, windows-2022]
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pyinstaller
-
-      - name: Build single-file executable
+      - name: Build single-file
         run: |
           pyinstaller --onefile --name "$APP_NAME" "$ENTRY"
-
-      - name: Collect artifacts & checksums
+      - name: Collect artifact (normalized name)
         run: |
           mkdir -p release
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             cp "dist/${APP_NAME}.exe" "release/${APP_NAME}-windows-x64.exe"
-            certutil -hashfile "release/${APP_NAME}-windows-x64.exe" SHA256 | tail -n 1 > "release/${APP_NAME}-windows-x64.exe.sha256"
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             cp "dist/${APP_NAME}" "release/${APP_NAME}-macos-arm64"
-            shasum -a 256 "release/${APP_NAME}-macos-arm64" | awk '{print $1}' > "release/${APP_NAME}-macos-arm64.sha256"
           else
             cp "dist/${APP_NAME}" "release/${APP_NAME}-linux-x64"
-            sha256sum "release/${APP_NAME}-linux-x64" | awk '{print $1}' > "release/${APP_NAME}-linux-x64.sha256"
           fi
-
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ runner.os }}-artifact
@@ -66,52 +54,53 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-22.04
+    env:
+      TAG:   ${{ github.ref_name }}                 # e.g. client-v1.0.3
+      OWNER: ${{ github.repository_owner }}
+      REPO:  ${{ github.event.repository.name }}
+      APP_NAME: ${{ env.APP_NAME }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: ./collected
-
       - name: Flatten artifacts
         run: |
           mkdir -p release
           find collected -type f -exec cp {} release/ \;
-
-      - name: Build manifest (clean checksums)
-        env:
-          TAG:   ${{ github.ref_name }}
-          OWNER: ${{ github.repository_owner }}
-          REPO:  ${{ github.event.repository.name }}
-          APP_NAME: ${{ env.APP_NAME }}
+          ls -al release
+      - name: Build manifest (Python, no control chars)
         run: |
-          set -euo pipefail
-          VERSION="${TAG#client-v}"
-          BASE="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}"
-          WIN="${APP_NAME}-windows-x64.exe"
-          MAC="${APP_NAME}-macos-arm64"
-          LIN="${APP_NAME}-linux-x64"
-
-          # Helper extracts exactly 64 hex chars and removes CR/LF
-          sha_clean() { grep -oE '[A-Fa-f0-9]{64}' | tr -d '\r\n'; }
-
-          WIN_SHA="$(cat "release/${WIN}.sha256" | sha_clean || true)"
-          MAC_SHA="$(cat "release/${MAC}.sha256" | sha_clean || true)"
-          LIN_SHA="$(cat "release/${LIN}.sha256" | sha_clean || true)"
-
           python3 - <<'PY'
-          import json, os
-          version = os.environ["VERSION"]
-          base = os.environ["BASE"]
-          win = os.environ["WIN"];  win_sha = os.environ.get("WIN_SHA","")
-          mac = os.environ["MAC"];  mac_sha = os.environ.get("MAC_SHA","")
-          lin = os.environ["LIN"];  lin_sha = os.environ.get("LIN_SHA","")
-          manifest = {
-            "version": version,
-            "assets": {
-              "windows": {"url": f"{base}/{win}", "sha256": win_sha},
-              "macos":   {"url": f"{base}/{mac}", "sha256": mac_sha},
-              "linux":   {"url": f"{base}/{lin}", "sha256": lin_sha},
-            },
+          import os, json, hashlib, pathlib
+          tag   = os.environ["TAG"]              # like client-v1.0.3
+          owner = os.environ["OWNER"]
+          repo  = os.environ["REPO"]
+          app   = os.environ["APP_NAME"]
+          base  = f"https://github.com/{owner}/{repo}/releases/download/{tag}"
+          files = {
+            "windows": f"{app}-windows-x64.exe",
+            "macos":   f"{app}-macos-arm64",
+            "linux":   f"{app}-linux-x64",
           }
-          with open("release/client-manifest.json","w", encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False)
+          def sha256(path: pathlib.Path) -> str:
+            h = hashlib.sha256()
+            with path.open("rb") as f:
+              for chunk in iter(lambda: f.read(1<<20), b""):
+                h.update(chunk)
+            return h.hexdigest()
+          manifest = {
+            "version": tag.removeprefix("client-v"),
+            "assets": {
+              k: {"url": f"{base}/{fname}",
+                  "sha256": sha256(pathlib.Path("release")/fname)}
+              for k, fname in files.items()
+            }
+          }
+          with open("release/client-manifest.json","w",encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False)
           PY
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
