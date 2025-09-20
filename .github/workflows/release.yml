@@ -3,7 +3,7 @@ name: Build client executables
 on:
   push:
     tags:
-      - "client-v*.*.*"   # tag like client-v1.0.3
+      - "client-v*.*.*"   # tag like client-v1.0.7
 
 permissions:
   contents: write
@@ -12,10 +12,9 @@ defaults:
   run:
     shell: bash
 
-# Change these for your project
 env:
-  APP_NAME: scrapeclient        # <- desired binary name
-  ENTRY: client.py         # <- python entry file
+  APP_NAME: scrapeclient        # <- your binary name
+  ENTRY: client.py              # <- your python entry file
 
 jobs:
   build:
@@ -55,7 +54,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-22.04
-    # no need to mirror APP_NAME here; it's inherited from top-level env
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -67,38 +65,87 @@ jobs:
           find collected -type f -exec cp {} release/ \;
           ls -al release
 
-      - name: Build manifest (Python, clean checksums)
+      # ---- Package macOS as ZIP with a double-click launcher ----
+      - name: Package macOS (.zip with run.command)
+        run: |
+          set -euo pipefail
+          APP="$APP_NAME"
+          MAC_BIN="release/${APP}-macos-arm64"
+          # README for mac users
+          cat > release/README-mac.txt <<'TXT'
+          How to run:
+          1) Double-click run.command (macOS will open Terminal and execute the app)
+          2) If you see an "unidentified developer" prompt, right-click run.command → Open → Open
+          TXT
+          # run.command that launches the binary and keeps the window open
+          cat > release/run.command <<'SH'
+          #!/bin/bash
+          cd "$(dirname "$0")"
+          export API_BASE="https://api.lnlabs.xyz"
+          chmod +x "./'"$APP_NAME"'-macos-arm64"
+          "./'"$APP_NAME"'-macos-arm64"
+          echo
+          read -n 1 -s -p "Press any key to close"
+          SH
+          chmod +x release/run.command
+          # Make sure the binary is executable before zipping (permission preserved in zip)
+          chmod +x "$MAC_BIN"
+          # Create the zip (no folder nesting; all files at top level)
+          (cd release && zip -q -r "${APP}-macos-arm64.zip" "${APP}-macos-arm64" run.command README-mac.txt)
+
+      # ---- Package Linux as tar.gz (preserves +x) ----
+      - name: Package Linux (.tar.gz)
+        run: |
+          set -euo pipefail
+          APP="$APP_NAME"
+          LIN_BIN="release/${APP}-linux-x64"
+          chmod +x "$LIN_BIN"
+          (cd release && tar -czf "${APP}-linux-x64.tar.gz" "${APP}-linux-x64")
+
+      # ---- Compute SHA256 of packaged files (and exe) + Build manifest ----
+      - name: Build manifest (Python, clean)
+        env:
+          TAG: ${{ github.ref_name }}  # e.g., client-v1.0.7
         run: |
           python3 - <<'PY'
           import os, json, hashlib, pathlib
-          app   = os.environ.get("APP_NAME", "yourapp")
-          tag   = os.environ["GITHUB_REF_NAME"]  # e.g. client-v1.0.3
+          app   = os.environ.get("APP_NAME", "scrapeclient")
+          tag   = os.environ["TAG"]
           owner = os.environ["GITHUB_REPOSITORY_OWNER"]
           repo  = os.environ["GITHUB_REPOSITORY"].split("/")[1]
           base  = f"https://github.com/{owner}/{repo}/releases/download/{tag}"
-          files = {
-            "windows": f"{app}-windows-x64.exe",
-            "macos":   f"{app}-macos-arm64",
-            "linux":   f"{app}-linux-x64",
-          }
-          def sha256(p: pathlib.Path) -> str:
+
+          # Our shipped assets
+          win = f"{app}-windows-x64.exe"
+          mac = f"{app}-macos-arm64.zip"     # packaged zip
+          lin = f"{app}-linux-x64.tar.gz"    # packaged tar.gz
+
+          def sha256(path: pathlib.Path) -> str:
             h = hashlib.sha256()
-            with p.open("rb") as f:
-              for chunk in iter(lambda: f.read(1<<20), b""): h.update(chunk)
+            with path.open("rb") as f:
+              for chunk in iter(lambda: f.read(1<<20), b""):
+                h.update(chunk)
             return h.hexdigest()
+
+          rel = pathlib.Path("release")
           manifest = {
             "version": tag.removeprefix("client-v"),
             "assets": {
-              k: {"url": f"{base}/{fname}", "sha256": sha256(pathlib.Path("release")/fname)}
-              for k, fname in files.items()
-            }
+              "windows": {"url": f"{base}/{win}", "sha256": sha256(rel / win)},
+              "macos":   {"url": f"{base}/{mac}", "sha256": sha256(rel / mac)},
+              "linux":   {"url": f"{base}/{lin}", "sha256": sha256(rel / lin)},
+            },
           }
-          with open("release/client-manifest.json","w",encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False)
+          with open(rel / "client-manifest.json","w",encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False)
           PY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
+          files: |
+            release/${{ env.APP_NAME }}-windows-x64.exe
+            release/${{ env.APP_NAME }}-macos-arm64.zip
+            release/${{ env.APP_NAME }}-linux-x64.tar.gz
+            release/client-manifest.json
           generate_release_notes: true
