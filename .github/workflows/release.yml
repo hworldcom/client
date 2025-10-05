@@ -3,7 +3,7 @@ name: Build client executables
 on:
   push:
     tags:
-      - "client-v*.*.*"   # tag like client-v1.0.7
+      - "client-v*.*.*"   # tag like client-v1.2.0
 
 permissions:
   contents: write
@@ -13,8 +13,15 @@ defaults:
     shell: bash
 
 env:
-  APP_NAME: scrapeclient        # <- your binary name
-  ENTRY: client.py              # <- your python entry file
+  # ---- Names you can customize ----
+  CLI_NAME: scrapeclient                 # final name for CLI binary
+  GUI_NAME: lnlabs-agent                 # final name for GUI app/artifacts (no spaces)
+  # ---- Entrypoints (update if you placed files elsewhere) ----
+  CLI_ENTRY: src/lnlabs_agent/cli.py     # headless agent
+  GUI_ENTRY: src/lnlabs_agent/gui.py     # Tkinter GUI
+  # ---- Icon files (optional) ----
+  MAC_ICON: assets/icon.icns
+  WIN_ICON: assets/icon.ico
 
 jobs:
   build:
@@ -23,32 +30,57 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-22.04, macos-14, windows-2022]
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pyinstaller
-      - name: Build single-file
+          python -m pip install pyinstaller
+
+      # ---------- macOS: build GUI app + DMG ----------
+      - name: Build GUI (macOS)
+        if: runner.os == 'macOS'
         run: |
-          pyinstaller --onefile --name "$APP_NAME" "$ENTRY"
-      - name: Collect artifact (normalized name)
-        run: |
+          set -euo pipefail
+          pyinstaller -w -n "$GUI_NAME" -i "$MAC_ICON" -p src "$GUI_ENTRY"
+          # Create DMG
+          brew install create-dmg || true
           mkdir -p release
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp "dist/${APP_NAME}.exe" "release/${APP_NAME}-windows-x64.exe"
-          elif [[ "$RUNNER_OS" == "macOS" ]]; then
-            cp "dist/${APP_NAME}" "release/${APP_NAME}-macos-arm64"
-          else
-            cp "dist/${APP_NAME}" "release/${APP_NAME}-linux-x64"
-          fi
+          create-dmg "release/${GUI_NAME}-macos-arm64.dmg" "dist/${GUI_NAME}.app"
+          ls -al release
+
+      # ---------- Windows: build GUI exe ----------
+      - name: Build GUI (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          pyinstaller -F -w -n "$GUI_NAME" -i "$WIN_ICON" -p src "$GUI_ENTRY"
+          mkdir -p release
+          cp "dist/${GUI_NAME}.exe" "release/${GUI_NAME}-windows-x64.exe"
+          ls -al release
+
+      # ---------- Linux: build CLI onefile + tar.gz ----------
+      - name: Build CLI (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          pyinstaller --onefile --name "$CLI_NAME" -p src "$CLI_ENTRY"
+          mkdir -p release
+          chmod +x "dist/${CLI_NAME}"
+          cp "dist/${CLI_NAME}" "release/${CLI_NAME}-linux-x64"
+          (cd release && tar -czf "${CLI_NAME}-linux-x64.tar.gz" "${CLI_NAME}-linux-x64")
+          ls -al release
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ runner.os }}-artifact
+          name: ${{ runner.os }}-artifacts
           path: release/*
 
   release:
@@ -63,62 +95,31 @@ jobs:
         run: |
           mkdir -p release
           find collected -type f -exec cp {} release/ \;
+          echo "Collected:"
           ls -al release
 
-      # ---- Package macOS as ZIP with a double-click launcher ----
-      - name: Package macOS (.zip with run.command)
-        run: |
-          set -euo pipefail
-          APP="$APP_NAME"
-          MAC_BIN="release/${APP}-macos-arm64"
-          # README for mac users
-          cat > release/README-mac.txt <<'TXT'
-          How to run:
-          1) Double-click run.command (macOS will open Terminal and execute the app)
-          2) If you see an "unidentified developer" prompt, right-click run.command → Open → Open
-          TXT
-          # run.command that launches the binary and keeps the window open
-          cat > release/run.command <<'SH'
-          #!/bin/bash
-          cd "$(dirname "$0")"
-          export API_BASE="https://api.lnlabs.xyz"
-          chmod +x "./'"$APP_NAME"'-macos-arm64"
-          "./'"$APP_NAME"'-macos-arm64"
-          echo
-          read -n 1 -s -p "Press any key to close"
-          SH
-          chmod +x release/run.command
-          # Make sure the binary is executable before zipping (permission preserved in zip)
-          chmod +x "$MAC_BIN"
-          # Create the zip (no folder nesting; all files at top level)
-          (cd release && zip -q -r "${APP}-macos-arm64.zip" "${APP}-macos-arm64" run.command README-mac.txt)
-
-      # ---- Package Linux as tar.gz (preserves +x) ----
-      - name: Package Linux (.tar.gz)
-        run: |
-          set -euo pipefail
-          APP="$APP_NAME"
-          LIN_BIN="release/${APP}-linux-x64"
-          chmod +x "$LIN_BIN"
-          (cd release && tar -czf "${APP}-linux-x64.tar.gz" "${APP}-linux-x64")
-
-      # ---- Compute SHA256 of packaged files (and exe) + Build manifest ----
-      - name: Build manifest (Python, clean)
+      # ---- Compute SHA256 and build manifest pointing to DMG/EXE/tar.gz ----
+      - name: Build manifest (Python)
         env:
-          TAG: ${{ github.ref_name }}  # e.g., client-v1.0.7
+          TAG: ${{ github.ref_name }}  # e.g., client-v1.2.0
+          REPO: ${{ github.repository }} # owner/repo
+          GUI_NAME: ${{ env.GUI_NAME }}
+          CLI_NAME: ${{ env.CLI_NAME }}
         run: |
           python3 - <<'PY'
-          import os, json, hashlib, pathlib
-          app   = os.environ.get("APP_NAME", "scrapeclient")
+          import os, json, hashlib, pathlib, urllib.parse
           tag   = os.environ["TAG"]
-          owner = os.environ["GITHUB_REPOSITORY_OWNER"]
-          repo  = os.environ["GITHUB_REPOSITORY"].split("/")[1]
-          base  = f"https://github.com/{owner}/{repo}/releases/download/{tag}"
+          repo  = os.environ["REPO"]               # owner/repo
+          owner = repo.split('/')[0]
+          name  = repo.split('/')[1]
+          gui   = os.environ["GUI_NAME"]
+          cli   = os.environ["CLI_NAME"]
+          base  = f"https://github.com/{owner}/{name}/releases/download/{tag}"
 
-          # Our shipped assets
-          win = f"{app}-windows-x64.exe"
-          mac = f"{app}-macos-arm64.zip"     # packaged zip
-          lin = f"{app}-linux-x64.tar.gz"    # packaged tar.gz
+          # Filenames we produced:
+          mac = f"{gui}-macos-arm64.dmg"
+          win = f"{gui}-windows-x64.exe"
+          lin = f"{cli}-linux-x64.tar.gz"
 
           def sha256(path: pathlib.Path) -> str:
             h = hashlib.sha256()
@@ -128,24 +129,32 @@ jobs:
             return h.hexdigest()
 
           rel = pathlib.Path("release")
+          files = { "macos": mac, "windows": win, "linux": lin }
+
+          for label, fn in files.items():
+            p = rel / fn
+            if not p.exists():
+              raise SystemExit(f"Missing artifact for {label}: {p}")
+
           manifest = {
             "version": tag.removeprefix("client-v"),
             "assets": {
-              "windows": {"url": f"{base}/{win}", "sha256": sha256(rel / win)},
-              "macos":   {"url": f"{base}/{mac}", "sha256": sha256(rel / mac)},
-              "linux":   {"url": f"{base}/{lin}", "sha256": sha256(rel / lin)},
+              "macos":   {"url": f"{base}/{urllib.parse.quote(mac)}", "sha256": sha256(rel / mac)},
+              "windows": {"url": f"{base}/{urllib.parse.quote(win)}", "sha256": sha256(rel / win)},
+              "linux":   {"url": f"{base}/{urllib.parse.quote(lin)}", "sha256": sha256(rel / lin)},
             },
           }
-          with open(rel / "client-manifest.json","w",encoding="utf-8") as f:
-              json.dump(manifest, f, ensure_ascii=False)
+          (rel / "client-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+          print("Manifest:")
+          print(json.dumps(manifest, indent=2))
           PY
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/${{ env.APP_NAME }}-windows-x64.exe
-            release/${{ env.APP_NAME }}-macos-arm64.zip
-            release/${{ env.APP_NAME }}-linux-x64.tar.gz
+            release/${{ env.GUI_NAME }}-macos-arm64.dmg
+            release/${{ env.GUI_NAME }}-windows-x64.exe
+            release/${{ env.CLI_NAME }}-linux-x64.tar.gz
             release/client-manifest.json
           generate_release_notes: true
