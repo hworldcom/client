@@ -1,4 +1,50 @@
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Python bytecode / build ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.spec
+.eggs/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+
+# --- Virtual envs ---
+.venv/
+venv/
+ENV/
+.env
+.env.*
+
+# --- Project packaging/build outputs ---
 build/
 dist/
-*.spec
-.venv
+release/
+*.spec          # PyInstaller spec files (if generated)
+
+# --- macOS DMG build staging / outputs ---
+dmgroot/
+*.dmg
+rw.*.dmg
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+
+# --- Logs ---
+*.log
+
+# --- Node (if any JS scripts exist here) ---
+node_modules/
+
+# --- Keep these committed (so explicitly unignore just in case) ---
+!assets/
+!pyproject.toml

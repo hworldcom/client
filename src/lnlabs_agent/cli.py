@@ -13,7 +13,7 @@ import signal
 import sys
 from typing import Optional
 
-from .core import (
+from lnlabs_agent.core import (
     pair_with_code,
     load_token,
     save_token,

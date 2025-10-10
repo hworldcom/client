@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import traceback
 
-from .core import (
+from lnlabs_agent.core import (
     API_BASE,
     load_token,
     save_token,
