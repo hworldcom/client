@@ -29,6 +29,55 @@ TOKEN_FILE = os.path.join(CONF_DIR, "agent_token")
 HEARTBEAT_SEC = 10
 JOB_IDLE_SEC = 2
 
+
+# --- DUMMY GENERATORS -------------------------------------------------
+
+def _slugify_company(s: str) -> str:
+    s = s.strip().lower()
+    if s.startswith("http"):
+        # extract last non-empty path segment
+        try:
+            from urllib.parse import urlparse
+            p = urlparse(s)
+            parts = [x for x in p.path.split("/") if x]
+            if parts:
+                s = parts[-1]
+        except Exception:
+            pass
+    return s.replace(" ", "-")
+
+def dummy_companies(urls: list[str]) -> dict:
+    """
+    For each input company (name or URL) return a couple of dummy profile URLs.
+    """
+    out = {}
+    for raw in urls:
+        slug = _slugify_company(raw)
+        out[raw] = {
+            "employees": [
+                f"https://www.linkedin.com/in/{slug}-employee-a/",
+                f"https://www.linkedin.com/in/{slug}-employee-b/",
+            ]
+        }
+    time.sleep(1.5)
+    return out
+
+def dummy_profiles(urls: list[str]) -> dict:
+    """
+    For each profile URL return some dummy mutuals; if URL contains 'direct', say 1st.
+    """
+    out = {}
+    for u in urls:
+        degree = "1st" if "direct" in u else "2nd"
+        conns = [
+            {"url": f"{u.rstrip('/')}-mutual-1/", "degree": degree},
+            {"url": f"{u.rstrip('/')}-mutual-2/", "degree": "3rd" if degree != "1st" else "2nd"},
+        ]
+        out[u] = {"connections": conns}
+    time.sleep(1.5)
+    return out
+
+
 # -------------------------
 # Token storage
 # -------------------------
@@ -114,55 +163,35 @@ def dummy_mutuals(urls: List[str]) -> Dict[str, Dict]:
 # Background agent runner
 # -------------------------
 class AgentRunner(threading.Thread):
-    """
-    Single-thread background runner that:
-      - Sends periodic heartbeats
-      - Polls for jobs
-      - Returns results
-    """
-
-    def __init__(self, token: str, on_log: Optional[Callable[[str], None]] = None):
-        super().__init__(daemon=True)
-        self.token = token
-        self.on_log = on_log or (lambda s: None)
-        self._stop_evt = threading.Event()
-
-    def stop(self) -> None:
-        self._stop_evt.set()
-
-    def log(self, msg: str) -> None:
-        try:
-            self.on_log(msg)
-        except Exception:
-            pass
-
+    # ... keep __init__/stop/log as before ...
     def run(self) -> None:
         last_hb = 0.0
         self.log("AgentRunner started.")
         while not self._stop_evt.is_set():
             now = time.time()
-            # heartbeat
             if now - last_hb >= HEARTBEAT_SEC:
                 ok = send_heartbeat(self.token)
                 self.log(f"Heartbeat: {'ok' if ok else 'failed'}")
                 last_hb = now
-
-            # poll for a job
             try:
                 job = next_job(self.token)
                 if not job:
                     time.sleep(JOB_IDLE_SEC)
                     continue
 
-                job_id = job["id"]
-                urls = job["urls"]
-                self.log(f"Job {job_id} received ({len(urls)} urls)")
+                job_id = job.get("id")
+                urls   = job.get("urls") or []
+                mode   = (job.get("mode") or job.get("type") or "profiles").lower()
+                self.log(f"Job {job_id} received mode={mode} ({len(urls)} items)")
 
-                result = dummy_mutuals(urls)
+                if mode == "companies":
+                    result = dummy_companies(urls)
+                else:  # "profiles" (default)
+                    result = dummy_profiles(urls)
+
                 send_result(self.token, job_id, result)
                 self.log(f"Job {job_id} done")
             except Exception as e:
                 self.log(f"Job loop error: {e}")
                 time.sleep(3)
-
         self.log("AgentRunner stopped.")
