@@ -163,7 +163,29 @@ def dummy_mutuals(urls: List[str]) -> Dict[str, Dict]:
 # Background agent runner
 # -------------------------
 class AgentRunner(threading.Thread):
-    # ... keep __init__/stop/log as before ...
+
+    """
+    Single-thread background runner that:
+      - Sends periodic heartbeats
+      - Polls for jobs
+      - Returns results
+    """
+
+    def __init__(self, token: str, on_log: Optional[Callable[[str], None]] = None):
+        super().__init__(daemon=True)
+        self.token = token
+        self.on_log = on_log or (lambda s: None)
+        self._stop_evt = threading.Event()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    def log(self, msg: str) -> None:
+        try:
+            self.on_log(msg)
+        except Exception:
+            pass
+
     def run(self) -> None:
         last_hb = 0.0
         self.log("AgentRunner started.")
