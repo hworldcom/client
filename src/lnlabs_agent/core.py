@@ -191,10 +191,13 @@ class AgentRunner(threading.Thread):
         self.log("AgentRunner started.")
         while not self._stop_evt.is_set():
             now = time.time()
+            # heartbeat
             if now - last_hb >= HEARTBEAT_SEC:
                 ok = send_heartbeat(self.token)
                 self.log(f"Heartbeat: {'ok' if ok else 'failed'}")
                 last_hb = now
+
+            # poll for a job
             try:
                 job = next_job(self.token)
                 if not job:
