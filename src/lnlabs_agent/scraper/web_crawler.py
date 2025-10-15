@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 from datetime import datetime
 import re
-
+from contextlib import asynccontextmanager
 import pyautogui
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
@@ -40,36 +40,54 @@ class WebCrawler:
         except Exception as e:
             self.log(f"[shot] failed: {e}")
 
-
-    # in start()
-    async def start(self, headless: bool = False) -> bool:
-        self.playwright = await async_playwright().start()
-        launch_kwargs = {"headless": headless}
-        if self.browser_exe:
-            launch_kwargs["executable_path"] = self.browser_exe
-        self.browser = await self.playwright.chromium.launch(**launch_kwargs)
-        self.context = await self.browser.new_context()
-        await self._load_cookies()
-        self.page = await self.context.new_page()
-
-        # Pipe page console to agent log (very helpful)
-        self.page.on("console", lambda msg: self.log(f"[page.console] {msg.type} {msg.text}"))
-
-        self.log("[start] browser launched")
-        await self._shot("after-start")
-        return True
-
-
-
-    async def stop(self) -> None:
+    @asynccontextmanager
+    async def session(self, headless: bool = False):
+        """
+        Opens playwright → browser → context → page, yields the crawler with page ready,
+        and *reliably* tears everything down with timeouts.
+        """
+        self.playwright = self.browser = self.context = self.page = None
         try:
-            if self.context:
-                await self.context.close()
+            self.playwright = await async_playwright().start()
+            launch_kwargs = {"headless": headless}
+            if self.browser_exe:
+                launch_kwargs["executable_path"] = self.browser_exe
+            self.browser = await self.playwright.chromium.launch(**launch_kwargs)
+            self.context = await self.browser.new_context()
+            await self._load_cookies()
+            self.page = await self.context.new_page()
+
+            # Optional console piping for debugging
+            self.page.on("console", lambda msg: self.log(f"[page.console] {msg.type} {msg.text}"))
+
+            self.log("[session] started")
+            yield self
         finally:
+            # teardown with timeouts so we never hang
+            async def _close_safely(coro, name: str, sec: float = 3.0):
+                try:
+                    await asyncio.wait_for(coro, timeout=sec)
+                    self.log(f"[session] closed {name}")
+                except Exception as e:
+                    self.log(f"[session] close {name} skipped/failed: {e}")
+
+            if self.page and not self.page.is_closed():
+                try:
+                    # don’t block here — closing context will close pages
+                    pass
+                except Exception:
+                    pass
+            if self.context:
+                await _close_safely(self.context.close(), "context", 3.0)
             if self.browser:
-                await self.browser.close()
+                await _close_safely(self.browser.close(), "browser", 3.0)
             if self.playwright:
-                await self.playwright.stop()
+                try:
+                    await asyncio.wait_for(self.playwright.stop(), timeout=2.0)
+                except Exception:
+                    self.log("[session] playwright.stop timeout/ignored")
+            self.log("[session] ended")
+
 
     # -------- auth helpers --------
     async def login_if_needed(self, wait_ms: int = 30_000) -> bool:

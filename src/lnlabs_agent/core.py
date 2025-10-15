@@ -274,7 +274,6 @@ class AgentRunner(threading.Thread):
                 self.log(f"Job {job_id} received mode={mode} ({len(urls)} items)")
 
                 if mode == "companies":
-                    result: Dict[str, Dict] = {}
                     ensure_playwright_chromium_installed(self.log)
 
                     os.makedirs(CONF_DIR, exist_ok=True)
@@ -285,19 +284,7 @@ class AgentRunner(threading.Thread):
                             "Chromium was not found after install. Check network/proxy and try again. "
                             f"Browsers dir: {BROWSERS_DIR}"
                         )
-
-                    crawler = WebCrawler(
-                        cookie_file=COOKIE_FILE,
-                        browser_exe=chromium_exe,
-                        logger=self.log,                # <— pipe logs to agent UI/console
-                        artifacts_dir=artifacts_dir,    # <— screenshots will land here
-                    )
-                    try:
-                        asyncio.run(self._companies_flow(crawler, urls, result))
-                    finally:
-                        try: asyncio.run(crawler.stop())
-                        except Exception: pass
-
+                    result = asyncio.run(self._companies_flow(urls))
                 else:
                     # Placeholder for profiles, keep dummy for now
                     result = dummy_profiles(urls)
@@ -316,23 +303,16 @@ class AgentRunner(threading.Thread):
                     self.log(f"[job {job_id}] could not send failure result: {e2}")
 
     # helper so we can use asyncio within thread
-    async def _companies_flow(self, crawler: WebCrawler, companies: list[str], out: dict) -> None:
-        await crawler.start(headless=False)
-        await crawler.login_if_needed()
-        for comp in companies:
-            try:
-                self.log(f"[job] company={comp} start (timeout 120s)")
-                names, urls = await asyncio.wait_for(crawler.start_company_flow(comp), timeout=120)
-                out[comp] = {"employees": urls}
-                self.log(f"[job] company={comp} ok {len(urls)} urls")
-            except asyncio.TimeoutError:
-                self.log(f"[job] company={comp} timed out")
-                out[comp] = {"error": "timeout", "employees": []}
-                # optional: take a last screenshot
+    async def _companies_flow(self, urls: list[str]) -> dict:
+        result: dict[str, dict] = {}
+        crawler = WebCrawler(logger=self.log, artifacts_dir=".artifacts")
+        async with crawler.session(headless=False):
+            await crawler.login_if_needed()
+            for comp in urls:
                 try:
-                    await crawler._shot(f"timeout-{comp}")
-                except Exception:
-                    pass
-            except Exception as e:
-                self.log(f"[job] company={comp} error: {e}")
-                out[comp] = {"error": str(e), "employees": []}
+                    names, links = await crawler.start_company_flow(comp)
+                    result[comp] = {"employees": links, "count": len(links)}
+                except Exception as e:
+                    self.log(f"[job] company={comp} error: {e}")
+                    result[comp] = {"error": str(e), "employees": []}
+        return result
