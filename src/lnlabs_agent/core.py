@@ -1,19 +1,31 @@
 # src/lnlabs_agent/core.py
 """
-Shared client logic: pairing, token storage, heartbeats, job polling, and dummy results.
+Shared client logic: pairing, token storage, heartbeats, job polling, and scraping.
 Used by both the CLI and GUI.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 import json
 import time
 import threading
 from typing import Callable, Optional, Dict, List
 
+import subprocess
 import requests
 from platformdirs import user_config_dir
+import platform
+from pathlib import Path
+
+# -------------------------
+# Async helper for threads
+# -------------------------
+import asyncio
+
+# Playwright scraper
+from lnlabs_agent.scraper.web_crawler import WebCrawler
 
 # -------------------------
 # Config / constants
@@ -25,57 +37,18 @@ API_BASE = os.environ.get("API_BASE", "https://api.lnlabs.xyz")
 
 CONF_DIR = user_config_dir(APP_NAME, VENDOR)
 TOKEN_FILE = os.path.join(CONF_DIR, "agent_token")
+COOKIE_FILE = os.path.join(CONF_DIR, "linkedin_cookies.json")
+
+# NEW: where Playwright should put its browser binaries
+BROWSERS_DIR = os.path.join(CONF_DIR, "pw-browsers")
+
+# Make sure Playwright honors that location (must be set before Playwright is used)
+os.makedirs(BROWSERS_DIR, exist_ok=True)
+artifacts_dir = os.path.join(CONF_DIR, "artifacts")
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", BROWSERS_DIR)
 
 HEARTBEAT_SEC = 10
 JOB_IDLE_SEC = 2
-
-
-# --- DUMMY GENERATORS -------------------------------------------------
-
-def _slugify_company(s: str) -> str:
-    s = s.strip().lower()
-    if s.startswith("http"):
-        # extract last non-empty path segment
-        try:
-            from urllib.parse import urlparse
-            p = urlparse(s)
-            parts = [x for x in p.path.split("/") if x]
-            if parts:
-                s = parts[-1]
-        except Exception:
-            pass
-    return s.replace(" ", "-")
-
-def dummy_companies(urls: list[str]) -> dict:
-    """
-    For each input company (name or URL) return a couple of dummy profile URLs.
-    """
-    out = {}
-    for raw in urls:
-        slug = _slugify_company(raw)
-        out[raw] = {
-            "employees": [
-                f"https://www.linkedin.com/in/{slug}-employee-a/",
-                f"https://www.linkedin.com/in/{slug}-employee-b/",
-            ]
-        }
-    time.sleep(1.5)
-    return out
-
-def dummy_profiles(urls: list[str]) -> dict:
-    """
-    For each profile URL return some dummy mutuals; if URL contains 'direct', say 1st.
-    """
-    out = {}
-    for u in urls:
-        degree = "1st" if "direct" in u else "2nd"
-        conns = [
-            {"url": f"{u.rstrip('/')}-mutual-1/", "degree": degree},
-            {"url": f"{u.rstrip('/')}-mutual-2/", "degree": "3rd" if degree != "1st" else "2nd"},
-        ]
-        out[u] = {"connections": conns}
-    time.sleep(1.5)
-    return out
 
 
 # -------------------------
@@ -86,12 +59,12 @@ def _ensure_conf_dir() -> None:
 
 def save_token(tok: str) -> None:
     _ensure_conf_dir()
-    with open(TOKEN_FILE, "w") as f:
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
         f.write(tok.strip())
 
 def load_token() -> Optional[str]:
     try:
-        with open(TOKEN_FILE, "r") as f:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     except FileNotFoundError:
         return None
@@ -136,38 +109,129 @@ def next_job(token: str) -> Optional[Dict]:
     r.raise_for_status()
     return r.json().get("job")
 
-def send_result(token: str, job_id: str, result: Dict) -> None:
-    r = requests.post(
-        f"{API_BASE}/agent/result",
-        headers={"X-Agent-Token": token, "content-type": "application/json"},
-        data=json.dumps({"job_id": job_id, "result": result}),
-        timeout=30,
-    )
-    r.raise_for_status()
+def run_coro(coro):
+    """
+    Run an async coroutine inside a dedicated event loop (safe inside threads).
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        # allow pending tasks to finalize gracefully
+        try:
+            loop.run_until_complete(asyncio.sleep(0))
+        except Exception:
+            pass
+        loop.close()
+
 
 # -------------------------
-# Dummy "scrape" (placeholder)
+# Optional: dummy generators (kept for 'profiles' mode placeholder)
 # -------------------------
-def dummy_mutuals(urls: List[str]) -> Dict[str, Dict]:
+def dummy_profiles(urls: List[str]) -> Dict[str, Dict]:
     """
-    Fabricate mutuals for each profile URL. Replace this with real logic later.
+    For each profile URL return some dummy mutuals; if URL contains 'direct', say 1st.
     """
-    # simulate a bit of work
-    time.sleep(2)
-    return {
-        u: {"mutuals": ["alice.smith", "bob.jones", "carol.lee"], "count": 3}
-        for u in urls
-    }
+    out = {}
+    for u in urls:
+        degree = "1st" if "direct" in u else "2nd"
+        conns = [
+            {"url": f"{u.rstrip('/')}-mutual-1/", "degree": degree},
+            {"url": f"{u.rstrip('/')}-mutual-2/", "degree": "3rd" if degree != "1st" else "2nd"},
+        ]
+        out[u] = {"connections": conns}
+    time.sleep(1.5)
+    return out
+
+
+# -------------------------
+# Playwright bootstrap
+# -------------------------
+def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> None:
+    os.makedirs(BROWSERS_DIR, exist_ok=True)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
+
+    # If we already have a valid executable, skip install
+    exe = _chromium_exe_from_cache(BROWSERS_DIR)
+    if exe:
+        log(f"Chromium present at: {exe}")
+        return
+
+    try:
+        log("Ensuring Playwright Chromium is installed…")
+        from playwright.__main__ import main as pw_main
+        import sys as _sys
+        old = list(_sys.argv)
+        try:
+            _sys.argv = ["playwright", "install", "chromium"]
+            pw_main()  # reads sys.argv
+        finally:
+            _sys.argv = old
+    except Exception as e:
+        log(f"Playwright install failed: {e}")
+
+    # Log what we found after install
+    exe = _chromium_exe_from_cache(BROWSERS_DIR)
+    log(f"Post-install chromium: {exe or 'NOT FOUND'}")
+
+
+def _chromium_exe_from_cache(browsers_dir: str) -> Optional[str]:
+    """
+    Return full path to the Chromium binary inside our per-user browsers cache,
+    or None if not found.
+    """
+    root = Path(browsers_dir)
+    if not root.exists():
+        return None
+
+    # Find a chromium-* folder
+    chromium_folders = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("chromium-")])
+    if not chromium_folders:
+        return None
+    croot = chromium_folders[-1]  # pick the newest/last
+
+    sysname = platform.system().lower()
+    if sysname == "darwin":   # macOS
+        cand = croot / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium"
+    elif sysname == "windows":
+        cand = croot / "chrome-win" / "chrome.exe"
+    else:                     # linux
+        cand = croot / "chrome-linux" / "chrome"
+
+    return str(cand) if cand.exists() else None
+
+def send_result(token: str, job_id: str, result: dict) -> None:
+    url = f"{API_BASE}/agent/result"
+    payload = {"job_id": job_id, "result": result}
+    headers = {"X-Agent-Token": token}
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code // 100 == 2:
+                return
+            # log non-2xx
+            print(f"[result] POST {url} -> {r.status_code}: {r.text[:500]}")
+        except Exception as e:
+            last_exc = e
+            print(f"[result] exception on attempt {attempt+1}: {e}")
+        time.sleep(1.5)
+
+    if last_exc:
+        raise last_exc
+    else:
+        raise RuntimeError(f"send_result failed: {r.status_code} {r.text[:500]}")
 
 # -------------------------
 # Background agent runner
 # -------------------------
 class AgentRunner(threading.Thread):
-
     """
     Single-thread background runner that:
       - Sends periodic heartbeats
       - Polls for jobs
+      - Executes scraping logic
       - Returns results
     """
 
@@ -206,17 +270,69 @@ class AgentRunner(threading.Thread):
 
                 job_id = job.get("id")
                 urls   = job.get("urls") or []
-                mode   = (job.get("mode") or job.get("type") or "profiles").lower()
+                mode   = (job.get("mode") or "profiles").lower()
                 self.log(f"Job {job_id} received mode={mode} ({len(urls)} items)")
 
                 if mode == "companies":
-                    result = dummy_companies(urls)
-                else:  # "profiles" (default)
+                    result: Dict[str, Dict] = {}
+                    ensure_playwright_chromium_installed(self.log)
+
+                    os.makedirs(CONF_DIR, exist_ok=True)
+                    chromium_exe = _chromium_exe_from_cache(BROWSERS_DIR)  # <— NEW
+                    if not chromium_exe:
+                        # Give a clear message and abort this job gracefully
+                        raise RuntimeError(
+                            "Chromium was not found after install. Check network/proxy and try again. "
+                            f"Browsers dir: {BROWSERS_DIR}"
+                        )
+
+                    crawler = WebCrawler(
+                        cookie_file=COOKIE_FILE,
+                        browser_exe=chromium_exe,
+                        logger=self.log,                # <— pipe logs to agent UI/console
+                        artifacts_dir=artifacts_dir,    # <— screenshots will land here
+                    )
+                    try:
+                        asyncio.run(self._companies_flow(crawler, urls, result))
+                    finally:
+                        try: asyncio.run(crawler.stop())
+                        except Exception: pass
+
+                else:
+                    # Placeholder for profiles, keep dummy for now
                     result = dummy_profiles(urls)
 
+
+                self.log(f"[job {job_id}] sending result …")
                 send_result(self.token, job_id, result)
-                self.log(f"Job {job_id} done")
+                self.log(f"[job {job_id}] result sent ✅")
             except Exception as e:
-                self.log(f"Job loop error: {e}")
-                time.sleep(3)
-        self.log("AgentRunner stopped.")
+                self.log(f"[job {job_id}] error: {e} — sending failure result")
+                fail = {"error": str(e), "ok": False}
+                try:
+                    send_result(self.token, job_id, fail)
+                    self.log(f"[job {job_id}] failure result sent ❌")
+                except Exception as e2:
+                    self.log(f"[job {job_id}] could not send failure result: {e2}")
+
+    # helper so we can use asyncio within thread
+    async def _companies_flow(self, crawler: WebCrawler, companies: list[str], out: dict) -> None:
+        await crawler.start(headless=False)
+        await crawler.login_if_needed()
+        for comp in companies:
+            try:
+                self.log(f"[job] company={comp} start (timeout 120s)")
+                names, urls = await asyncio.wait_for(crawler.start_company_flow(comp), timeout=120)
+                out[comp] = {"employees": urls}
+                self.log(f"[job] company={comp} ok {len(urls)} urls")
+            except asyncio.TimeoutError:
+                self.log(f"[job] company={comp} timed out")
+                out[comp] = {"error": "timeout", "employees": []}
+                # optional: take a last screenshot
+                try:
+                    await crawler._shot(f"timeout-{comp}")
+                except Exception:
+                    pass
+            except Exception as e:
+                self.log(f"[job] company={comp} error: {e}")
+                out[comp] = {"error": str(e), "employees": []}

@@ -1,2 +1,4 @@
-requests==2.32.3
-platformdirs
+playwright>=1.47
+pyautogui>=0.9
+platformdirs>=4
+requests>=2.32
