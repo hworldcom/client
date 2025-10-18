@@ -1,14 +1,15 @@
 # src/lnlabs_agent/scraper/web_crawler.py
 from __future__ import annotations
-import asyncio, json, os, random, time, subprocess
-from typing import List, Tuple, Optional, Callable
-from urllib.parse import urlparse
+
+import os, json, re, random, asyncio
 from pathlib import Path
-from datetime import datetime
-import re
 from contextlib import asynccontextmanager
-import pyautogui
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from typing import Optional, Callable, List
+from datetime import datetime
+
+from playwright.async_api import async_playwright
+from platformdirs import user_log_dir
+
 
 class WebCrawler:
     def __init__(
@@ -19,18 +20,37 @@ class WebCrawler:
         browser_exe: Optional[str] = None,
         logger: Optional[Callable[[str], None]] = None,
         artifacts_dir: Optional[str] = None,
+        audit_log_path: Optional[str] = None,
+        verbose_network: bool = True,
     ):
-        self.URL = base_url.rstrip('/') + '/'
+        self.URL = base_url.rstrip("/") + "/"
         self.COOKIE_FILE = cookie_file
         self.WINDOW_OFFSET = window_offset
         self.browser_exe = browser_exe
         self.log = logger or (lambda s: None)
+        self.verbose_network = verbose_network
+
+        # screenshots / small artifacts
         self.artifacts_dir = Path(artifacts_dir or ".artifacts")
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        # ...
 
+        # file audit log (blocked/failed requests, filtered console)
+        default_dir = Path(user_log_dir("LNLabsAgent", "LNLabs"))
+        default_dir.mkdir(parents=True, exist_ok=True)
+        self.audit_log_path = Path(audit_log_path or (default_dir / "network.log"))
+        self._audit_max_bytes = 5 * 1024 * 1024  # 5MB roll
+
+        # console suppression
+        self._suppress_console_re = re.compile(r"ERR_BLOCKED_BY_CLIENT")
+
+        # runtime objects
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    # ---------- screenshots ----------
     async def _shot(self, name: str) -> None:
-        """Save a quick screenshot for debugging."""
         try:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             path = self.artifacts_dir / f"{ts}-{name}.png"
@@ -40,54 +60,147 @@ class WebCrawler:
         except Exception as e:
             self.log(f"[shot] failed: {e}")
 
+    # ---------- public session helpers ----------
     @asynccontextmanager
     async def session(self, headless: bool = False):
-        """
-        Opens playwright → browser → context → page, yields the crawler with page ready,
-        and *reliably* tears everything down with timeouts.
-        """
-        self.playwright = self.browser = self.context = self.page = None
+        """Use as: `async with crawler.session(): ...`"""
+        await self._prepare_context(headless=headless)
         try:
-            self.playwright = await async_playwright().start()
-            launch_kwargs = {"headless": headless}
-            if self.browser_exe:
-                launch_kwargs["executable_path"] = self.browser_exe
-            self.browser = await self.playwright.chromium.launch(**launch_kwargs)
-            self.context = await self.browser.new_context()
-            await self._load_cookies()
-            self.page = await self.context.new_page()
-
-            # Optional console piping for debugging
-            self.page.on("console", lambda msg: self.log(f"[page.console] {msg.type} {msg.text}"))
-
-            self.log("[session] started")
             yield self
         finally:
-            # teardown with timeouts so we never hang
-            async def _close_safely(coro, name: str, sec: float = 3.0):
-                try:
-                    await asyncio.wait_for(coro, timeout=sec)
-                    self.log(f"[session] closed {name}")
-                except Exception as e:
-                    self.log(f"[session] close {name} skipped/failed: {e}")
+            await self._teardown_context()
 
-            if self.page and not self.page.is_closed():
+    async def __aenter__(self):
+        await self._prepare_context(headless=False)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._teardown_context()
+
+    # ---------- audit (file-only) ----------
+    def _audit_write(self, line: str) -> None:
+        try:
+            if self.audit_log_path.exists() and self.audit_log_path.stat().st_size > self._audit_max_bytes:
+                rotated = self.audit_log_path.with_suffix(".log.1")
                 try:
-                    # don’t block here — closing context will close pages
-                    pass
+                    rotated.unlink(missing_ok=True)
                 except Exception:
                     pass
+                try:
+                    self.audit_log_path.rename(rotated)
+                except Exception:
+                    pass
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            with self.audit_log_path.open("a", encoding="utf-8") as f:
+                f.write(f"{ts} {line}\n")
+        except Exception:
+            pass
+
+    def audit(self, line: str) -> None:
+        if self.verbose_network:
+            self._audit_write(line)
+
+    # ---------- attach page listeners ----------
+    def _attach_page_logging(self) -> None:
+        assert self.page
+
+        # network failures (includes exact URL + error)
+    def on_request_failed(req):
+        try:
+            # failure can be a dict, a string, or an object with .error_text/.errorText
+            failure = getattr(req, "failure", None)
+            if isinstance(failure, dict):
+                err = failure.get("errorText") or failure.get("error_text") or ""
+            elif isinstance(failure, str):
+                err = failure
+            else:
+                err = getattr(failure, "error_text", "") or getattr(failure, "errorText", "") or ""
+
+            # headers can be dict; on some versions use .all_headers()
+            try:
+                headers = req.headers or {}
+            except Exception:
+                try:
+                    headers = req.all_headers()  # newer Playwright
+                except Exception:
+                    headers = {}
+
+            ref = headers.get("referer") or headers.get("referrer") or "-"
+            self.audit(f"[failed] {req.method} {req.url} :: {err} ref={ref}")
+        except Exception as e:
+            # never crash event loop; just log to audit
+            self.audit(f"[failed:handler-error] {e!r}")
+
+        # console messages — suppress ERR_BLOCKED_BY_CLIENT in GUI, but keep in audit
+        def on_console(msg):
+            txt = msg.text or ""
+            if self._suppress_console_re.search(txt):
+                self.audit(f"[console-blocked] {msg.type} {txt}")
+                return  # do not bubble to GUI
+            self.log(f"[page.console] {msg.type} {txt}")
+
+        self.page.on("requestfailed", on_request_failed)
+        self.page.on("console", on_console)
+
+    # ---------- playwright context ----------
+    async def _prepare_context(self, headless: bool):
+        self.playwright = await async_playwright().start()
+        kw = {"headless": headless}
+        if self.browser_exe:
+            kw["executable_path"] = self.browser_exe
+        self.browser = await self.playwright.chromium.launch(**kw)
+        self.context = await self.browser.new_context()
+
+        # block noisy trackers; audit anything we block
+        BLOCK = [
+            "doubleclick.net",
+            "googletagmanager.com",
+            "google-analytics.com",
+            "px.ads.linkedin.com",
+            "ads.linkedin.com",
+        ]
+
+        async def router(route, request):
+            if any(p in request.url for p in BLOCK):
+                self.audit(f"[blocked] {request.resource_type} {request.url}")
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await self.context.route("**/*", router)
+
+        # cookies
+        if os.path.exists(self.COOKIE_FILE):
+            try:
+                with open(self.COOKIE_FILE, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                await self.context.add_cookies(cookies)
+            except Exception:
+                pass
+
+        self.page = await self.context.new_page()
+        self._attach_page_logging()
+
+        self.log("[session] browser ready")
+
+    async def _teardown_context(self):
+        try:
             if self.context:
-                await _close_safely(self.context.close(), "context", 3.0)
-            if self.browser:
-                await _close_safely(self.browser.close(), "browser", 3.0)
-            if self.playwright:
+                # best-effort cookie save
                 try:
-                    await asyncio.wait_for(self.playwright.stop(), timeout=2.0)
+                    cookies = await self.context.cookies()
+                    with open(self.COOKIE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(cookies, f)
                 except Exception:
-                    self.log("[session] playwright.stop timeout/ignored")
-            self.log("[session] ended")
-
+                    pass
+                await self.context.close()
+        finally:
+            if self.browser:
+                await self.browser.close()
+            if self.playwright:
+                await self.playwright.stop()
+        self.page = self.context = self.browser = self.playwright = None
+        self.log("[session] closed")
 
     # -------- auth helpers --------
     async def login_if_needed(self, wait_ms: int = 30_000) -> bool:
@@ -110,14 +223,16 @@ class WebCrawler:
         self.log("[auth] already logged in (cookies worked)")
         return True
 
-
     async def safe_login(self, max_retries: int = 3) -> bool:
         assert self.page
         for attempt in range(max_retries):
             try:
                 await self.page.goto(self.URL + "login", timeout=6_000)
                 await self.page.wait_for_load_state("domcontentloaded")
-                if any(k in self.page.url for k in ("linkedin.com/feed", "linkedin.com/in", "linkedin.com/login")):
+                if any(
+                    k in self.page.url
+                    for k in ("linkedin.com/feed", "linkedin.com/in", "linkedin.com/login")
+                ):
                     return True
                 print(f"[!] Unexpected URL: {self.page.url}, retrying…")
             except Exception as e:
@@ -128,7 +243,7 @@ class WebCrawler:
     async def is_authwall(self) -> bool:
         assert self.page
         try:
-            meta_tag = await self.page.locator('meta[name="pageKey"]').get_attribute('content')
+            meta_tag = await self.page.locator('meta[name="pageKey"]').get_attribute("content")
             return bool(meta_tag and meta_tag.startswith("auth_wall"))
         except Exception:
             return False
@@ -180,7 +295,7 @@ class WebCrawler:
                 continue
         raise TimeoutError(f"None of selectors appeared: {selectors}")
 
-    # -------- your search routines (kept) --------
+    # -------- basic helpers --------
     async def locate(self, sel: str, timeout: int = 10_000):
         assert self.page
         loc = self.page.locator(sel)
@@ -217,6 +332,7 @@ class WebCrawler:
         assert self.page
         await self.page.keyboard.press("Enter")
 
+    # -------- main flows --------
     async def start_company_flow(self, company: str):
         self.log(f"[flow] company={company}")
         await self._shot("before-search")
@@ -227,7 +343,6 @@ class WebCrawler:
         await self._shot("after-company-flow")
         return names, urls
 
-    # ====== pasted/minimally adapted from your functions ======
     async def _extract_data_urls_names_company(self, company: str, out_names: list[str], out_urls: list[str]):
         self.log("[step] locate search box")
         search_box = await self.locate(".search-global-typeahead input")
@@ -238,9 +353,9 @@ class WebCrawler:
         await self.type(company)
         await self.press_enter()
         await self.page.wait_for_timeout(5_000)
-        # after you submit the search query:
         await self._shot("after-enter")
-        await self._click_companies_tab_simple()    # ← replaces the old ambiguous locator
+
+        await self._click_companies_tab_simple()
         await self._shot("companies-tab")
 
         self.log("[step] wait results container")
@@ -262,7 +377,7 @@ class WebCrawler:
                 if href and "/company/" in href:
                     a_tag = cand
                     break
-            except:
+            except Exception:
                 continue
         if not a_tag:
             await self._shot("no-company-link")
@@ -274,19 +389,18 @@ class WebCrawler:
         await self._shot("company-opened")
 
         self.log("[step] open employees")
-        employee_button = await self.locate("div.org-top-card-summary-info-list div.inline-block >> a:has(span:has-text('employees'))")
+        employee_button = await self.locate(
+            "div.org-top-card-summary-info-list div.inline-block >> a:has(span:has-text('employees'))"
+        )
         await self._shot("employees-link")
         await self.click(employee_button)
         await self.page.wait_for_load_state("domcontentloaded")
 
-        self.log("[step] filter 2nd-degree")
-
-        # Prefer the toolbar radio (your DOM variant)
+        self.log("[step] filter 2nd-degree]")
         try:
             await self._select_second_degree_toolbar_first()
         except Exception as e:
             self.log(f"[filters] toolbar path failed: {e} → trying filter panel")
-            # Fallbacks for other UIs:
             await self._open_connections_filter()
             await self._select_second_degree()
             await self._apply_filters_if_present()
@@ -298,7 +412,8 @@ class WebCrawler:
         self.log(f"[step] extracted {len(out_urls)} urls")
 
     async def _extract_data_names_urls(self, out_names: list[str], out_urls: list[str]):
-        page = self.page; assert page
+        page = self.page
+        assert page
         page_i = 1
         while True:
             self.log(f"[page{page_i}] wait results")
@@ -307,45 +422,37 @@ class WebCrawler:
             cards = await page.locator('[data-view-name="people-search-result"]').all()
             self.log(f"[page{page_i}] cards={len(cards)}")
 
-            # ... (existing loop)
             for i, card in enumerate(cards):
                 try:
-                    # Prefer the explicit title link
                     title_link = card.locator('a[data-view-name="search-result-lockup-title"]').first
                     if await title_link.count() > 0:
                         name = (await title_link.inner_text()).strip()
                         href = await title_link.get_attribute("href")
                     else:
-                        # Fallback: any link to /in/...
                         any_profile = card.locator('a[href*="linkedin.com/in/"]').first
                         href = await any_profile.get_attribute("href")
-                        # Fallback name
                         name_p = card.locator('p >> a[href*="linkedin.com/in/"]').first
                         name = (await name_p.inner_text()).strip() if await name_p.count() > 0 else "(unknown)"
 
                     if href:
-                        # ✅ correct order: name → out_names, href → out_urls
                         out_names.append(name)
                         out_urls.append(href)
                         self.log(f"[✓] {name} → {href}")
                 except Exception as e:
                     self.log(f"[!] Error on card {i}: {e}")
 
-            # Pagination (no networkidle here)
             clicked = await self._click_next_or_stop()
             if not clicked:
                 break
-            self.log(f"[page{page_i}] next → {page_i+1}")
-            await page.wait_for_timeout(600)  # tiny settle, optional
+            self.log(f"[page{page_i}] next → {page_i + 1}")
+            await page.wait_for_timeout(600)
             page_i += 1
 
     async def _open_connections_filter(self) -> None:
-        """Open the 'Connections' filter panel, regardless of UI variant."""
         p = self.page
         assert p
 
         self.log("[filters] try open 'Connections' pill by role")
-        # Variant A: a pill/tab button named "Connections"
         try:
             btn = p.get_by_role("button", name=lambda n: n and "connections" in n.lower())
             await btn.wait_for(timeout=3000)
@@ -355,7 +462,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # ✅ Variant A2: data attribute used by some UIs
         try:
             pill = p.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']")
             await pill.wait_for(timeout=2000)
@@ -365,7 +471,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # Variant B: an input/menu button with aria-label
         try:
             btn = p.locator("button[aria-label*='Connections' i]")
             await btn.first.wait_for(timeout=3000)
@@ -375,7 +480,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # Variant C: open "All filters", then ensure 'Connections' section is visible
         self.log("[filters] try via 'All filters'")
         try:
             allf = p.get_by_role("button", name=lambda n: n and "all filters" in n.lower())
@@ -389,26 +493,21 @@ class WebCrawler:
             await self._shot("connections-open-failed")
             raise
 
-
-
     async def _select_second_degree(self) -> None:
-        """Select '2nd' connections using multiple UI fallbacks, then apply if needed."""
         p = self.page
         assert p
 
         self.log("[filters] selecting 2nd-degree")
 
-        # Fallback 1: ARIA radio by name
         try:
             radio = p.get_by_role("radio", name=lambda n: n and n.strip().startswith("2nd"))
             await radio.wait_for(timeout=2500)
-            await radio.click()  # or .check() if available
+            await radio.click()
             await self._shot("2nd-selected-radio")
             return
         except Exception:
             pass
 
-        # Fallback 2: a simple button with aria-label='2nd'
         try:
             btn = p.locator("button[aria-label='2nd']")
             await btn.first.wait_for(timeout=2500)
@@ -418,7 +517,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # Fallback 3: label '2nd' tied to an <input> (your DOM sample)
         try:
             lab = p.get_by_label("2nd")
             await lab.wait_for(timeout=2500)
@@ -428,7 +526,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # Fallback 4: generic label text search inside filters panel
         try:
             lab = p.locator("label", has_text="2nd")
             await lab.first.wait_for(timeout=2500)
@@ -441,34 +538,28 @@ class WebCrawler:
         await self._shot("2nd-not-found")
         raise TimeoutError("Could not find '2nd' option in Connections filter")
 
-
     async def _apply_filters_if_present(self) -> None:
         p = self.page
         assert p
         try:
-            btn = p.get_by_role("button", name=lambda n: n and ("show results" in n.lower() or "apply" in n.lower()))
+            btn = p.get_by_role(
+                "button", name=lambda n: n and ("show results" in n.lower() or "apply" in n.lower())
+            )
             await btn.wait_for(timeout=2000)
             await btn.click()
             await self._shot("filters-applied")
         except Exception:
-            # Not all variants need an explicit Apply
             pass
 
     async def _select_second_degree_toolbar_first(self) -> None:
-        """
-        Your current UI: radios for 1st / 2nd / 3rd+ appear directly in a top toolbar.
-        Click the '2nd' radio there.
-        """
         p = self.page
         assert p
         self.log("[filters] try toolbar radios (1st/2nd/3rd+)")
 
-        # Scope to the first filter toolbar (role="toolbar")
         toolbar = p.locator("div[role='toolbar']").first
         await toolbar.wait_for(timeout=5000)
         await self._shot("toolbar-present")
 
-        # EITHER click <label>2nd</label> …
         try:
             lab = toolbar.get_by_text(re.compile(r"^\s*2nd\s*$"))
             await lab.first.scroll_into_view_if_needed()
@@ -479,7 +570,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # … OR click radio by role/name
         try:
             radio = toolbar.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I))
             await radio.first.scroll_into_view_if_needed()
@@ -490,7 +580,6 @@ class WebCrawler:
         except Exception:
             pass
 
-        # … OR final fallback: any label '2nd' within toolbar
         try:
             lab = toolbar.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I))
             await lab.first.scroll_into_view_if_needed()
@@ -505,74 +594,46 @@ class WebCrawler:
         raise TimeoutError("Toolbar radios present but could not click '2nd'")
 
     async def _click_companies_tab_simple(self) -> None:
-        """
-        Click the 'Companies' pill in the Search filters toolbar—no hydration tricks,
-        no fallbacks—just find the pill in the toolbar you shared and click it.
-        """
-        p = self.page; assert p
+        p = self.page
+        assert p
         self.log("[companies] simple click in toolbar")
 
-        # Scope to the toolbar you pasted
         toolbar = p.locator("section.scaffold-layout-toolbar nav[aria-label='Search filters']").first
         await toolbar.wait_for(timeout=10000)
 
-        # Find the 'Companies' pill INSIDE the toolbar filter list
-        companies = toolbar.locator(
-            "ul.search-reusables__filter-list li button"
-        ).filter(has_text=re.compile(r"^\s*Companies\s*$", re.I)).first
+        companies = (
+            toolbar.locator("ul.search-reusables__filter-list li button")
+            .filter(has_text=re.compile(r"^\s*Companies\s*$", re.I))
+            .first
+        )
 
-        # Wait until that button is visible/clickable, then click
         await companies.wait_for(state="visible", timeout=10000)
         await companies.scroll_into_view_if_needed()
         await companies.click()
-
-        # (Optional) tiny settle
         await p.wait_for_timeout(500)
 
-
     async def locate_within_scroll(self, text, MAX_SCROLLS=5, DELAY=1):
-
         for i in range(MAX_SCROLLS):
-            # Try to locate the 'Next' button
             next_button = self.page.locator(text)
-            #self.random_mouse_movement()
-
             if await next_button.is_visible():
-                # Found the button
                 print(f"[✓] Found {text} after {i+1} scrolls.")
                 return next_button
-
-            await self.page.mouse.wheel(0, 1000)  # Scroll down
+            await self.page.mouse.wheel(0, 1000)
             await self.page.wait_for_timeout(DELAY * 1000)
-
-
-    # inside WebCrawler
 
     async def _find_next_button(self):
         p = self.page
-
-        # A. Preferred: the data-testid variant you pasted
         btn = p.locator("button[data-testid='pagination-controls-next-button-visible']").first
         if await btn.count():
             return btn
-
-        # B. Fallback: a button that *contains* “Next” (works on your DOM too)
-        # (kept as a fallback because of localization)
         btn2 = p.get_by_role("button", name="Next").first
         if await btn2.count():
             return btn2
-
         return None
 
-
     async def _click_next_or_stop(self) -> bool:
-        """
-        Click 'Next' if present & enabled. Return True if page is moving, False if last page.
-        Uses UI-change waits instead of networkidle.
-        """
         p = self.page
 
-        # Hidden → last page
         if await p.locator("button[data-testid='pagination-controls-next-button-hidden']").count():
             self.log("[page] next is hidden → last page")
             return False
@@ -582,14 +643,12 @@ class WebCrawler:
             self.log("[page] next not found → stop")
             return False
 
-        # Snapshot state before click
         prev_page = await self._current_page_label()
-        prev_key  = await self._first_result_key()
+        prev_key = await self._first_result_key()
 
         try:
             await btn.scroll_into_view_if_needed()
             await btn.wait_for(state="visible", timeout=3000)
-            # If LinkedIn toggles disabled, respect it
             try:
                 if await btn.get_attribute("disabled") is not None:
                     self.log("[page] next disabled → stop")
@@ -599,21 +658,20 @@ class WebCrawler:
 
             await btn.click()
 
-            # Wait for either page badge or first-result to change (no networkidle)
             try:
                 await p.wait_for_function(
                     """
                     ([prevPage, prevKey]) => {
                       const pageEl = document.querySelector('button[aria-current="true"][aria-label^="Page"] span');
                       const curPage = pageEl ? pageEl.textContent.trim() : null;
-    
-                      const card = document.querySelector('[data-view-name="people-search-result'], [data-view-name="search-result"]');
+
+                      const card = document.querySelector('[data-view-name="people-search-result"], [data-view-name="search-result"]');
                       let curKey = null;
                       if (card) {
                         const link = card.querySelector('a[href*="linkedin.com/in/"]');
                         curKey = link?.getAttribute('href') || (card.textContent || '').trim().slice(0, 200);
                       }
-    
+
                       const pageChanged = !!curPage && curPage !== prevPage;
                       const keyChanged  = !!curKey  && curKey  !== prevKey;
                       return pageChanged || keyChanged;
@@ -623,7 +681,6 @@ class WebCrawler:
                     timeout=12_000,
                 )
             except Exception:
-                # soft settle—don’t blow up the loop
                 await p.wait_for_timeout(800)
 
             return True
@@ -632,9 +689,7 @@ class WebCrawler:
             self.log(f"[page] next click failed (stop): {e}")
             return False
 
-
     async def _current_page_label(self) -> str | None:
-        # e.g. aria-current="true" and aria-label="Page 3"
         el = self.page.locator('button[aria-current="true"][aria-label^="Page"] span').first
         if await el.count():
             try:
@@ -644,11 +699,9 @@ class WebCrawler:
         return None
 
     async def _first_result_key(self) -> str | None:
-        """
-        Something stable-ish to detect that results changed.
-        Tries: first profile card's href or text.
-        """
-        card = self.page.locator('[data-view-name="people-search-result"], [data-view-name="search-result"]').first
+        card = self.page.locator(
+            '[data-view-name="people-search-result"], [data-view-name="search-result"]'
+        ).first
         if await card.count():
             try:
                 link = card.locator('a[href*="linkedin.com/in/"]').first
@@ -656,7 +709,6 @@ class WebCrawler:
                     href = await link.get_attribute("href")
                     if href:
                         return href
-                # fallback to text blob
                 txt = await card.text_content()
                 return (txt or "").strip()[:200]
             except Exception:

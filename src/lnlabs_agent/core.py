@@ -2,27 +2,29 @@
 """
 Shared client logic: pairing, token storage, heartbeats, job polling, and scraping.
 Used by both the CLI and GUI.
+
+Key change: WebCrawler is used via an async context-managed session:
+    async with WebCrawler(...).session(headless=False) as c:
+        await c.login_if_needed()
+        ...
+
+This guarantees browser teardown even on exceptions (no explicit stop()).
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import json
 import time
 import threading
 from typing import Callable, Optional, Dict, List
 
-import subprocess
-import requests
-from platformdirs import user_config_dir
+import asyncio
 import platform
 from pathlib import Path
 
-# -------------------------
-# Async helper for threads
-# -------------------------
-import asyncio
+import requests
+from platformdirs import user_config_dir
 
 # Playwright scraper
 from lnlabs_agent.scraper.web_crawler import WebCrawler
@@ -39,17 +41,17 @@ CONF_DIR = user_config_dir(APP_NAME, VENDOR)
 TOKEN_FILE = os.path.join(CONF_DIR, "agent_token")
 COOKIE_FILE = os.path.join(CONF_DIR, "linkedin_cookies.json")
 
-# NEW: where Playwright should put its browser binaries
+# Where Playwright should put its browser binaries (per-user cache)
 BROWSERS_DIR = os.path.join(CONF_DIR, "pw-browsers")
-
-# Make sure Playwright honors that location (must be set before Playwright is used)
 os.makedirs(BROWSERS_DIR, exist_ok=True)
-artifacts_dir = os.path.join(CONF_DIR, "artifacts")
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", BROWSERS_DIR)
+
+# Artifacts (screenshots, etc.)
+ARTIFACTS_DIR = os.path.join(CONF_DIR, "artifacts")
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
 HEARTBEAT_SEC = 10
 JOB_IDLE_SEC = 2
-
 
 # -------------------------
 # Token storage
@@ -109,24 +111,33 @@ def next_job(token: str) -> Optional[Dict]:
     r.raise_for_status()
     return r.json().get("job")
 
-def run_coro(coro):
+def send_result(token: str, job_id: str, result: dict) -> None:
     """
-    Run an async coroutine inside a dedicated event loop (safe inside threads).
+    Robust result sender with a few retries.
     """
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        # allow pending tasks to finalize gracefully
-        try:
-            loop.run_until_complete(asyncio.sleep(0))
-        except Exception:
-            pass
-        loop.close()
+    url = f"{API_BASE}/agent/result"
+    payload = {"job_id": job_id, "result": result}
+    headers = {"X-Agent-Token": token}
 
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            if 200 <= r.status_code < 300:
+                return
+            print(f"[result] POST {url} -> {r.status_code}: {r.text[:500]}")
+        except Exception as e:
+            last_exc = e
+            print(f"[result] exception on attempt {attempt+1}: {e}")
+        time.sleep(1.5)
+
+    if last_exc:
+        raise last_exc
+    else:
+        raise RuntimeError(f"send_result failed: {r.status_code} {r.text[:500]}")
 
 # -------------------------
-# Optional: dummy generators (kept for 'profiles' mode placeholder)
+# Optional: dummy generator for 'profiles' mode (placeholder)
 # -------------------------
 def dummy_profiles(urls: List[str]) -> Dict[str, Dict]:
     """
@@ -143,15 +154,16 @@ def dummy_profiles(urls: List[str]) -> Dict[str, Dict]:
     time.sleep(1.5)
     return out
 
-
 # -------------------------
 # Playwright bootstrap
 # -------------------------
 def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> None:
+    """
+    Ensure Playwright Chromium is present in our per-user cache.
+    """
     os.makedirs(BROWSERS_DIR, exist_ok=True)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = BROWSERS_DIR
 
-    # If we already have a valid executable, skip install
     exe = _chromium_exe_from_cache(BROWSERS_DIR)
     if exe:
         log(f"Chromium present at: {exe}")
@@ -159,21 +171,20 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> None:
 
     try:
         log("Ensuring Playwright Chromium is installed…")
+        # Use the Playwright CLI programmatically
         from playwright.__main__ import main as pw_main
         import sys as _sys
         old = list(_sys.argv)
         try:
             _sys.argv = ["playwright", "install", "chromium"]
-            pw_main()  # reads sys.argv
+            pw_main()
         finally:
             _sys.argv = old
     except Exception as e:
         log(f"Playwright install failed: {e}")
 
-    # Log what we found after install
     exe = _chromium_exe_from_cache(BROWSERS_DIR)
     log(f"Post-install chromium: {exe or 'NOT FOUND'}")
-
 
 def _chromium_exe_from_cache(browsers_dir: str) -> Optional[str]:
     """
@@ -184,7 +195,6 @@ def _chromium_exe_from_cache(browsers_dir: str) -> Optional[str]:
     if not root.exists():
         return None
 
-    # Find a chromium-* folder
     chromium_folders = sorted([p for p in root.iterdir() if p.is_dir() and p.name.startswith("chromium-")])
     if not chromium_folders:
         return None
@@ -199,29 +209,6 @@ def _chromium_exe_from_cache(browsers_dir: str) -> Optional[str]:
         cand = croot / "chrome-linux" / "chrome"
 
     return str(cand) if cand.exists() else None
-
-def send_result(token: str, job_id: str, result: dict) -> None:
-    url = f"{API_BASE}/agent/result"
-    payload = {"job_id": job_id, "result": result}
-    headers = {"X-Agent-Token": token}
-
-    last_exc = None
-    for attempt in range(3):
-        try:
-            r = requests.post(url, json=payload, headers=headers, timeout=30)
-            if r.status_code // 100 == 2:
-                return
-            # log non-2xx
-            print(f"[result] POST {url} -> {r.status_code}: {r.text[:500]}")
-        except Exception as e:
-            last_exc = e
-            print(f"[result] exception on attempt {attempt+1}: {e}")
-        time.sleep(1.5)
-
-    if last_exc:
-        raise last_exc
-    else:
-        raise RuntimeError(f"send_result failed: {r.status_code} {r.text[:500]}")
 
 # -------------------------
 # Background agent runner
@@ -274,38 +261,52 @@ class AgentRunner(threading.Thread):
                 self.log(f"Job {job_id} received mode={mode} ({len(urls)} items)")
 
                 if mode == "companies":
+                    # Ensure chromium is installed in our managed cache
                     ensure_playwright_chromium_installed(self.log)
 
-                    os.makedirs(CONF_DIR, exist_ok=True)
-                    chromium_exe = _chromium_exe_from_cache(BROWSERS_DIR)  # <— NEW
+                    # If still not present, fail the job gracefully
+                    chromium_exe = _chromium_exe_from_cache(BROWSERS_DIR)
                     if not chromium_exe:
-                        # Give a clear message and abort this job gracefully
                         raise RuntimeError(
                             "Chromium was not found after install. Check network/proxy and try again. "
                             f"Browsers dir: {BROWSERS_DIR}"
                         )
+
+                    # Run the scraping flow in an async context-managed session
                     result = asyncio.run(self._companies_flow(urls))
                 else:
-                    # Placeholder for profiles, keep dummy for now
+                    # Placeholder for 'profiles' mode
                     result = dummy_profiles(urls)
-
 
                 self.log(f"[job {job_id}] sending result …")
                 send_result(self.token, job_id, result)
                 self.log(f"[job {job_id}] result sent ✅")
+
             except Exception as e:
-                self.log(f"[job {job_id}] error: {e} — sending failure result")
+                # best-effort error result so the job completes visibly
+                try:
+                    self.log(f"[job {job_id}] error: {e} — sending failure result")
+                except Exception:
+                    self.log(f"[job] error before job_id known: {e}")
                 fail = {"error": str(e), "ok": False}
                 try:
-                    send_result(self.token, job_id, fail)
+                    send_result(self.token, job_id, fail)  # type: ignore[arg-type]
                     self.log(f"[job {job_id}] failure result sent ❌")
                 except Exception as e2:
                     self.log(f"[job {job_id}] could not send failure result: {e2}")
 
-    # helper so we can use asyncio within thread
+    # ---- async sub-flow for companies mode ----
     async def _companies_flow(self, urls: list[str]) -> dict:
+        """
+        One job = one browser session. Guarantees teardown via `async with`.
+        """
         result: dict[str, dict] = {}
-        crawler = WebCrawler(logger=self.log, artifacts_dir=".artifacts")
+        crawler = WebCrawler(
+            logger=self.log,
+            artifacts_dir=ARTIFACTS_DIR,
+            # You can pass browser_exe if you want to force a specific binary:
+            # browser_exe=_chromium_exe_from_cache(BROWSERS_DIR),
+        )
         async with crawler.session(headless=False):
             await crawler.login_if_needed()
             for comp in urls:
