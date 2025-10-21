@@ -323,6 +323,10 @@ class WebCrawler(SecureCookieMixin):
         return names, urls
 
     async def _extract_data_urls_names_company(self, company: str, out_names: list[str], out_urls: list[str]):
+
+        self.log("[step] go home before search")
+        await self._go_home()
+
         self.log("[step] locate search box")
         search_box = await self._find_global_search_input()
         await self._shot("search-box")
@@ -406,6 +410,33 @@ class WebCrawler(SecureCookieMixin):
         self.log("[step] extract names/urls (paged)")
         await self._extract_data_names_urls(out_names, out_urls)
         self.log(f"[step] extracted {len(out_urls)} urls")
+
+    async def _go_home(self) -> None:
+        """
+        Navigate to the LinkedIn feed to normalize the header/search UI
+        before starting a new search.
+        """
+        p = self.page; assert p
+        # Prefer the canonical feed URL (keeps existing query params harmless)
+        target = self.URL + "feed/?doFeedRefresh=true&nis=true"
+
+        # Use your robust loader
+        ok = await self.safe_goto(target, max_retries=3)
+        if not ok:
+            # Fall back to plain /feed/ if needed
+            await self.safe_goto(self.URL + "feed/", max_retries=2)
+
+        # Wait for either classic or new header to be present
+        await p.wait_for_selector(
+            "header#global-nav, div[role='search'] input[data-testid='typeahead-input']",
+            timeout=10_000
+        )
+
+        # Expand collapsed search if present and take a shot for debugging
+        try:
+            await self._ensure_search_box_open()
+        finally:
+            await self._shot("home-loaded")
 
     async def _extract_data_names_urls(self, out_names: list[str], out_urls: list[str]):
         page = self.page
