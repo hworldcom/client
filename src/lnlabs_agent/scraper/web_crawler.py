@@ -619,6 +619,13 @@ class WebCrawler(SecureCookieMixin):
 
     async def _extract_data_names_urls(self, out_names: list[str], out_urls: list[str]):
         p = self.page; assert p
+
+        # Best-effort: ensure the Artdeco pager is present/attached at least once.
+        try:
+            await p.wait_for_selector("div.artdeco-pagination, ul.artdeco-pagination__pages", timeout=4_000)
+        except Exception:
+            pass
+
         page_i = 1
         while True:
             self.log(f"[page{page_i}] wait results")
@@ -803,7 +810,7 @@ class WebCrawler(SecureCookieMixin):
             pass
 
         # Variant C: 'All filters' then ensure Connections section shows
-        self.log("[filters] try via 'All filters'")
+        self.log("[filters] try via 'All filters']")
         try:
             allf = nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I))
             await allf.first.wait_for(timeout=3000)
@@ -993,83 +1000,128 @@ class WebCrawler(SecureCookieMixin):
 
     async def _find_next_button(self):
         p = self.page
-        # Newer pagination
-        btn = p.locator("button[data-testid='pagination-controls-next-button-visible']").first
-        if await btn.count():
-            return btn
-        # Aria label
-        btn2 = p.get_by_role("button", name=re.compile(r"^\s*Next\s*$", re.I)).first
-        if await btn2.count():
-            return btn2
-        # Artdeco classic pagination
-        btn3 = p.locator("button.artdeco-pagination__button--next").first
-        if await btn3.count():
-            return btn3
+
+        # Scope to pagination container and scroll it into view if present
+        pagination = p.locator("div.artdeco-pagination").last
+        try:
+            if await pagination.count():
+                await pagination.scroll_into_view_if_needed()
+                await p.wait_for_timeout(150)
+        except Exception:
+            pass
+
+        # Try several strong selectors for the Next button
+        candidates = [
+            p.locator("button[data-testid='pagination-controls-next-button-visible']").first,
+            p.locator("button.artdeco-pagination__button--next").first,
+            p.locator("button[aria-label='Next']").first,
+            p.get_by_role("button", name=re.compile(r"^\s*Next\s*$", re.I)).first,
+            p.locator("nav[aria-label='Pagination'] button[aria-label='Next']").first,
+        ]
+
+        for cand in candidates:
+            try:
+                if await cand.count():
+                    return cand
+            except Exception:
+                continue
+
         return None
 
     async def _click_next_or_stop(self) -> bool:
         p = self.page
 
-        if await p.locator("button[data-testid='pagination-controls-next-button-hidden']").count():
-            self.log("[page] next is hidden → last page")
-            return False
+        # New UI variant: explicit hidden-next sentinel
+        try:
+            if await p.locator("button[data-testid='pagination-controls-next-button-hidden']").count():
+                self.log("[page] next is hidden → last page")
+                return False
+        except Exception:
+            pass
 
-        btn = await self._find_next_button()
-        if not btn:
-            self.log("[page] next not found → stop")
-            return False
-
+        # Remember current state to verify change
         prev_page = await self._current_page_label()
         prev_key = await self._first_result_key()
 
-        try:
-            await btn.scroll_into_view_if_needed()
-            await btn.wait_for(state="visible", timeout=3000)
+        # 1) Try a dedicated "Next" button
+        btn = await self._find_next_button()
+
+        # 2) If not found, fall back to clicking the next page number after the active li
+        page_number_fallback = None
+        if not btn:
             try:
-                if (await btn.get_attribute("disabled") is not None) or \
-                   ((await btn.get_attribute("aria-disabled")) in ("true", "True")):
-                    self.log("[page] next disabled → stop")
-                    return False
+                active_li = p.locator(
+                    "div.artdeco-pagination ul.artdeco-pagination__pages li.active, "
+                    "ul.artdeco-pagination__pages li.active, "
+                    "li.artdeco-pagination__indicator.active, "
+                    "li.artdeco-pagination__indicator.selected"
+                ).first
+
+                if await active_li.count():
+                    page_number_fallback = active_li.locator("~ li button").first
+                    if not await page_number_fallback.count():
+                        page_number_fallback = active_li.locator("xpath=following-sibling::li[1]//button").first
             except Exception:
                 pass
 
-            await btn.click()
-
-            try:
-                await p.wait_for_function(
-                    """
-                    ([prevPage, prevKey]) => {
-                      const pageEl = document.querySelector('button[aria-current="true"][aria-label^="Page"] span');
-                      const curPage = pageEl ? pageEl.textContent.trim() : null;
-
-                      const card = document.querySelector(
-                        '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn]'
-                      );
-                      let curKey = null;
-                      if (card) {
-                        const link = card.querySelector('a[href*="linkedin.com/in/"]');
-                        curKey = link?.getAttribute('href') || (card.textContent || '').trim().slice(0, 200);
-                      }
-
-                      const pageChanged = !!curPage && curPage !== prevPage;
-                      const keyChanged  = !!curKey  && curKey  !== prevKey;
-                      return pageChanged || keyChanged;
-                    }
-                    """,
-                    arg=[prev_page, prev_key],
-                    timeout=12_000,
-                )
-            except Exception:
-                await p.wait_for_timeout(800)
-
-            return True
-
-        except Exception as e:
-            self.log(f"[page] next click failed (stop): {e}")
+        if not btn and not page_number_fallback:
+            self.log("[page] next not found → stop")
             return False
 
+        target = btn or page_number_fallback
+
+        # Ensure interactable; bail if disabled
+        try:
+            await target.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            if (await target.get_attribute("disabled")) is not None or \
+               ((await target.get_attribute("aria-disabled")) in ("true", "True")):
+                self.log("[page] next disabled → stop")
+                return False
+        except Exception:
+            pass
+
+        # Click it
+        await target.click()
+
+        # Wait for page label or first-result key to change
+        try:
+            await p.wait_for_function(
+                """
+                ([prevPage, prevKey]) => {
+                  const pageEl =
+                    document.querySelector('button[aria-current="true"][aria-label^="Page"] span') ||
+                    document.querySelector('li.active button[aria-label^="Page"] span');
+                  const curPage = pageEl ? pageEl.textContent.trim() : null;
+
+                  const card = document.querySelector(
+                    '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn]'
+                  );
+                  let curKey = null;
+                  if (card) {
+                    const link = card.querySelector('a[href*="linkedin.com/in/"]');
+                    curKey = link?.getAttribute('href') || (card.textContent || '').trim().slice(0, 200);
+                  }
+
+                  const pageChanged = !!curPage && curPage !== prevPage;
+                  const keyChanged  = !!curKey  && curKey  !== prevKey;
+                  return pageChanged || keyChanged;
+                }
+                """,
+                arg=[prev_page, prev_key],
+                timeout=12_000,
+            )
+        except Exception:
+            await p.wait_for_timeout(900)
+
+        return True
+
     async def _current_page_label(self) -> str | None:
-        el = self.page.locator('button[aria-current="true"][aria-label^="Page"] span').first
+        el = self.page.locator(
+            'button[aria-current="true"][aria-label^="Page"] span, li.active button[aria-label^="Page"] span'
+        ).first
         if await el.count():
             try:
                 return (await el.text_content() or "").strip()
