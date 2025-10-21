@@ -68,6 +68,15 @@ class WebCrawler(SecureCookieMixin):
         self.context = None
         self.page = None
 
+        # --- results selectors (support multiple UI variants) ---
+        self.RESULT_CARD_SELECTORS = [
+            '[data-view-name="people-search-result"]',
+            '[data-view-name="search-result"]',
+            '[data-view-name="search-entity-result-universal-template"]',
+            '[data-view-name^="search-entity-result-"]',
+            '[data-chameleon-result-urn]',
+        ]
+
     def _abs(self, p: os.PathLike | str) -> Path:
         return Path(p).expanduser().resolve()
 
@@ -340,6 +349,38 @@ class WebCrawler(SecureCookieMixin):
         assert self.page
         await self.page.keyboard.press("Enter")
 
+    # ---------- results helpers ----------
+    async def _wait_for_results(self, timeout_ms: int = 20_000) -> None:
+        """
+        Wait until at least one result card is attached/visible using any known selector.
+        """
+        p = self.page; assert p
+
+        # Fast path: any visible selector quickly
+        for sel in self.RESULT_CARD_SELECTORS:
+            try:
+                await p.wait_for_selector(f"{sel} >> visible=true", timeout=3_000)
+                return
+            except Exception:
+                pass
+
+        # Slow path: any matching element in the DOM
+        await p.wait_for_function(
+            """(sels) => sels.some(s => document.querySelector(s))""",
+            arg=self.RESULT_CARD_SELECTORS,
+            timeout=timeout_ms,
+        )
+        await p.wait_for_timeout(400)
+
+    def _result_cards(self):
+        """
+        Locator that matches all likely result cards within the results container.
+        """
+        p = self.page; assert p
+        combined = ", ".join(self.RESULT_CARD_SELECTORS)
+        container = p.locator("div.search-results-container").first
+        return (container.locator(combined) if container else p.locator(combined))
+
     # -------- main flows --------
     async def start_company_flow(self, company: str):
         self.log(f"[flow] company={company}")
@@ -389,6 +430,7 @@ class WebCrawler(SecureCookieMixin):
 
         self.log("[step] wait results container")
         await self.wait_to_appear("div.search-results-container")
+        await self._wait_for_results()
         await self._shot("results-container")
 
         self.log("[step] find first company link")
@@ -434,7 +476,11 @@ class WebCrawler(SecureCookieMixin):
             await self._select_second_degree()
             await self._apply_filters_if_present()
 
-        await self.page.wait_for_timeout(800)
+        # Let client-side refresh finalize
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=5_000)
+        except Exception:
+            await self.page.wait_for_timeout(800)
 
         self.log("[step] extract names/urls (paged)")
         await self._extract_data_names_urls(out_names, out_urls)
@@ -468,32 +514,45 @@ class WebCrawler(SecureCookieMixin):
             await self._shot("home-loaded")
 
     async def _extract_data_names_urls(self, out_names: list[str], out_urls: list[str]):
-        page = self.page
-        assert page
+        p = self.page; assert p
         page_i = 1
         while True:
             self.log(f"[page{page_i}] wait results")
-            await page.wait_for_selector('[data-view-name="people-search-result"]', timeout=15_000)
+            await self._wait_for_results()
             await self._shot(f"page-{page_i}-results")
-            cards = await page.locator('[data-view-name="people-search-result"]').all()
+
+            cards = await self._result_cards().all()
             self.log(f"[page{page_i}] cards={len(cards)}")
 
             for i, card in enumerate(cards):
                 try:
-                    title_link = card.locator('a[data-view-name="search-result-lockup-title"]').first
-                    if await title_link.count() > 0:
-                        name = (await title_link.inner_text()).strip()
-                        href = await title_link.get_attribute("href")
-                    else:
-                        any_profile = card.locator('a[href*="linkedin.com/in/"]').first
-                        href = await any_profile.get_attribute("href")
-                        name_p = card.locator('p >> a[href*="linkedin.com/in/"]').first
-                        name = (await name_p.inner_text()).strip() if await name_p.count() > 0 else "(unknown)"
+                    # Prefer explicit profile link
+                    link = card.locator('a[href*="linkedin.com/in/"]').first
+                    if not await link.count():
+                        # Some legacy “lockup title” links
+                        link = card.locator('a[data-view-name="search-result-lockup-title"]').first
+                    if not await link.count():
+                        # Fallback: any anchor in the “linked area” (universal template)
+                        link = card.locator(".linked-area a[href]").first
 
-                    if href:
-                        out_names.append(name)
+                    href = await link.get_attribute("href") if await link.count() else None
+
+                    # Extract a name
+                    name_span = card.locator("a span[aria-hidden='true']").first
+                    name = (await name_span.inner_text()).strip() if await name_span.count() else None
+                    if not name and await link.count():
+                        txt = await link.inner_text()
+                        name = (txt or "").strip()
+
+                    # Skip non-result widgets (e.g., feedback card)
+                    dvn = (await card.get_attribute("data-view-name")) or ""
+                    if dvn == "search-feedback-card":
+                        continue
+
+                    if href and "linkedin.com/in/" in href:
+                        out_names.append(name or "(unknown)")
                         out_urls.append(href)
-                        self.log(f"[✓] {name} → {href}")
+                        self.log(f"[✓] {(name or '(unknown)')} → {href}")
                 except Exception as e:
                     self.log(f"[!] Error on card {i}: {e}")
 
@@ -501,7 +560,28 @@ class WebCrawler(SecureCookieMixin):
             if not clicked:
                 break
             self.log(f"[page{page_i}] next → {page_i + 1}")
-            await page.wait_for_timeout(600)
+
+            # Wait either for the page label to change or first result to differ
+            prev_key = await self._first_result_key()
+            try:
+                await p.wait_for_function(
+                    """
+                    (prevKey) => {
+                      const card = document.querySelector(
+                        '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn]'
+                      );
+                      if (!card) return false;
+                      const link = card.querySelector('a[href*="linkedin.com/in/"]');
+                      const curKey = link?.getAttribute('href') || (card.textContent || '').trim().slice(0, 200);
+                      return curKey && curKey !== prevKey;
+                    }
+                    """,
+                    arg=prev_key,
+                    timeout=10_000,
+                )
+            except Exception:
+                await p.wait_for_timeout(800)
+
             page_i += 1
 
     async def _ensure_search_box_open(self) -> None:
@@ -647,6 +727,10 @@ class WebCrawler(SecureCookieMixin):
             await radio.wait_for(timeout=2500)
             await radio.click()
             await self._shot("2nd-selected-radio")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
             return
         except Exception:
             pass
@@ -657,6 +741,10 @@ class WebCrawler(SecureCookieMixin):
             await btn.wait_for(timeout=2500)
             await btn.click()
             await self._shot("2nd-selected-button")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
             return
         except Exception:
             pass
@@ -667,6 +755,10 @@ class WebCrawler(SecureCookieMixin):
             await lab.wait_for(timeout=2500)
             await lab.click()
             await self._shot("2nd-selected-label")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
             return
         except Exception:
             pass
@@ -677,6 +769,10 @@ class WebCrawler(SecureCookieMixin):
             await lab.wait_for(timeout=2500)
             await lab.click()
             await self._shot("2nd-selected-generic-label")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
             return
         except Exception:
             pass
@@ -724,6 +820,10 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 pass
             await self._shot("2nd-selected-multiselect")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
             return
 
         # (2) Legacy UI: radios/labels inside a toolbar
@@ -737,6 +837,10 @@ class WebCrawler(SecureCookieMixin):
                 await radio.scroll_into_view_if_needed()
                 await radio.click()
                 await self._shot("2nd-selected-legacy-radio")
+                try:
+                    await p.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    await p.wait_for_timeout(600)
                 return
             # or explicit label inside toolbar
             lab = toolbar.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
@@ -744,6 +848,10 @@ class WebCrawler(SecureCookieMixin):
                 await lab.scroll_into_view_if_needed()
                 await lab.click()
                 await self._shot("2nd-selected-legacy-label")
+                try:
+                    await p.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    await p.wait_for_timeout(600)
                 return
         except Exception:
             pass
@@ -781,12 +889,18 @@ class WebCrawler(SecureCookieMixin):
 
     async def _find_next_button(self):
         p = self.page
+        # Newer pagination
         btn = p.locator("button[data-testid='pagination-controls-next-button-visible']").first
         if await btn.count():
             return btn
-        btn2 = p.get_by_role("button", name="Next").first
+        # Aria label
+        btn2 = p.get_by_role("button", name=re.compile(r"^\s*Next\s*$", re.I)).first
         if await btn2.count():
             return btn2
+        # Artdeco classic pagination
+        btn3 = p.locator("button.artdeco-pagination__button--next").first
+        if await btn3.count():
+            return btn3
         return None
 
     async def _click_next_or_stop(self) -> bool:
@@ -808,7 +922,8 @@ class WebCrawler(SecureCookieMixin):
             await btn.scroll_into_view_if_needed()
             await btn.wait_for(state="visible", timeout=3000)
             try:
-                if await btn.get_attribute("disabled") is not None:
+                if (await btn.get_attribute("disabled") is not None) or \
+                   ((await btn.get_attribute("aria-disabled")) in ("true", "True")):
                     self.log("[page] next disabled → stop")
                     return False
             except Exception:
@@ -823,7 +938,9 @@ class WebCrawler(SecureCookieMixin):
                       const pageEl = document.querySelector('button[aria-current="true"][aria-label^="Page"] span');
                       const curPage = pageEl ? pageEl.textContent.trim() : null;
 
-                      const card = document.querySelector('[data-view-name="people-search-result"], [data-view-name="search-result"]');
+                      const card = document.querySelector(
+                        '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn]'
+                      );
                       let curKey = null;
                       if (card) {
                         const link = card.querySelector('a[href*="linkedin.com/in/"]');
@@ -858,7 +975,7 @@ class WebCrawler(SecureCookieMixin):
 
     async def _first_result_key(self) -> str | None:
         card = self.page.locator(
-            '[data-view-name="people-search-result"], [data-view-name="search-result"]'
+            '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn]'
         ).first
         if await card.count():
             try:
