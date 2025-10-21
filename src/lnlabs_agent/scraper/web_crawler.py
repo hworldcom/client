@@ -425,7 +425,7 @@ class WebCrawler(SecureCookieMixin):
         await self.page.wait_for_timeout(1500)
         await self._shot("after-enter")
 
-        await self._click_companies_tab_simple()
+        await self._click_companies_tab()
         await self._shot("companies-tab")
 
         self.log("[step] wait results container")
@@ -485,6 +485,110 @@ class WebCrawler(SecureCookieMixin):
         self.log("[step] extract names/urls (paged)")
         await self._extract_data_names_urls(out_names, out_urls)
         self.log(f"[step] extracted {len(out_urls)} urls")
+
+    async def _click_companies_tab(self) -> None:
+        p = self.page
+        assert p
+        self.log("[companies] click 'Companies' pill (resilient)")
+
+        # 1) Wait for the filters bar to be present (attached), not strictly visible.
+        #    Try several stable anchors.
+        try:
+            await self.wait_for_any(
+                [
+                    "nav[aria-label='Search filters']",
+                    "#search-reusables__filters-bar",
+                    "ul.search-reusables__filter-list",
+                ],
+                timeout=12_000,
+            )
+        except Exception:
+            # As a last resort, small settle and screenshot for debugging
+            await p.wait_for_timeout(500)
+            await self._shot("companies-toolbar-not-found")
+            raise
+
+        # 2) Prefer to scope to the filters nav if it exists; otherwise search globally.
+        nav = p.locator("nav[aria-label='Search filters']").first
+        in_nav = nav.locator("ul.search-reusables__filter-list li button").filter(
+            has_text=re.compile(r"^\s*Companies\s*$", re.I)
+        ).first if await nav.count() else None
+
+        # Fallbacks in order of reliability.
+        candidates = [
+            in_nav,
+            p.locator("#search-reusables__filters-bar ul.search-reusables__filter-list li button")
+             .filter(has_text=re.compile(r"^\s*Companies\s*$", re.I)).first,
+            p.get_by_role("button", name=re.compile(r"^\s*Companies\s*$", re.I)).first,
+            p.locator("button.artdeco-pill", has_text=re.compile(r"^\s*Companies\s*$", re.I)).first,
+        ]
+
+        btn = None
+        for cand in candidates:
+            try:
+                if cand and await cand.count():
+                    btn = cand
+                    break
+            except Exception:
+                continue
+
+        if not btn:
+            await self._shot("companies-button-not-found")
+            raise TimeoutError("Could not find the 'Companies' pill")
+
+        # 3) Scroll, ensure interactable, click.
+        try:
+            await btn.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        try:
+            # Don't require 'visible=true' up front—just give it a moment, then click.
+            await btn.wait_for(timeout=5_000)
+        except Exception:
+            # Best-effort: tiny wait & shot, then keep going
+            await p.wait_for_timeout(200)
+            await self._shot("companies-before-click-forced")
+
+        await btn.click()
+        await p.wait_for_timeout(250)
+
+        # 4) Confirm selection: aria-pressed OR URL facet OR companies cards present.
+        try:
+            # a) aria-pressed turns true on the pill
+            await p.wait_for_function(
+                """
+                (sel) => {
+                  const el = document.querySelector(sel);
+                  return el && el.getAttribute('aria-pressed') === 'true';
+                }
+                """,
+                arg="button.artdeco-pill, button.search-reusables__filter-pill-button",
+                timeout=3_000,
+            )
+        except Exception:
+            pass
+
+        # b) URL facet often becomes 'search/results/companies'
+        try:
+            if "/search/results/companies" not in p.url:
+                await p.wait_for_function(
+                    "() => location.pathname.includes('/search/results/companies')",
+                    timeout=3_000,
+                )
+        except Exception:
+            pass
+
+        # c) Companies result hint: links containing '/company/'
+        try:
+            await p.wait_for_selector("a[href*='/company/']", timeout=6_000)
+        except Exception:
+            # Not fatal; take a shot for debugging
+            await self._shot("companies-after-click-no-company-links-yet")
+
+        await self._shot("companies-clicked")
+        self.log("[companies] pill clicked and validated (best-effort)")
+
 
     async def _go_home(self) -> None:
         """
