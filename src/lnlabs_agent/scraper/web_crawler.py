@@ -697,8 +697,9 @@ class WebCrawler(SecureCookieMixin):
 
     async def _select_second_degree_toolbar_first(self) -> None:
         """
-        On this UI variant, 1st/2nd/3rd+ are multiselect pills inside the Search filters nav.
-        Click the '2nd' pill there.
+        Prefer new UI multiselect pills (1st/2nd/3rd+). If missing, try the legacy
+        toolbar radios inside div[role='toolbar'] before letting the caller fall
+        back to the All filters panel.
         """
         p = self.page; assert p
         self.log("[filters] try multiselect pills for 1st/2nd/3rd+]")
@@ -706,28 +707,49 @@ class WebCrawler(SecureCookieMixin):
         nav = self._filters_nav()
         await nav.wait_for(timeout=7000)
 
-        # Prefer aria-label (stable)
+        # (1) New UI: multiselect pills
         btn = nav.locator(
             "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
         ).first
-
         if not await btn.count():
-            # Fallback: visible text
             btn = nav.locator(
                 "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
             ).first
+        if await btn.count():
+            await btn.scroll_into_view_if_needed()
+            await btn.wait_for(state="visible", timeout=3000)
+            await btn.click()
+            try:
+                await btn.wait_for_function("el => el.getAttribute('aria-pressed') === 'true'", timeout=2000)
+            except Exception:
+                pass
+            await self._shot("2nd-selected-multiselect")
+            return
 
-        await btn.scroll_into_view_if_needed()
-        await btn.wait_for(state="visible", timeout=3000)
-        await btn.click()
-
-        # Optional confirm toggled on
+        # (2) Legacy UI: radios/labels inside a toolbar
+        self.log("[filters] multiselect not found → try legacy toolbar radios")
+        toolbar = p.locator("div[role='toolbar']").first
         try:
-            await btn.wait_for_function("el => el.getAttribute('aria-pressed') === 'true'", timeout=2000)
+            await toolbar.wait_for(timeout=2500)
+            # radio by role/name
+            radio = toolbar.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
+            if await radio.count():
+                await radio.scroll_into_view_if_needed()
+                await radio.click()
+                await self._shot("2nd-selected-legacy-radio")
+                return
+            # or explicit label inside toolbar
+            lab = toolbar.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
+            if await lab.count():
+                await lab.scroll_into_view_if_needed()
+                await lab.click()
+                await self._shot("2nd-selected-legacy-label")
+                return
         except Exception:
             pass
 
-        await self._shot("2nd-selected-multiselect")
+        # (3) If neither variant is present, let the caller fall back to All filters.
+        raise TimeoutError("Neither multiselect pills nor legacy toolbar radios found")
 
     async def _click_companies_tab_simple(self) -> None:
         p = self.page
