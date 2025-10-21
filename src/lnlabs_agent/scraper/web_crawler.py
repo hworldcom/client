@@ -773,58 +773,115 @@ class WebCrawler(SecureCookieMixin):
         return self.page.locator("nav[aria-label='Search filters']").first
 
     async def _open_connections_filter(self) -> None:
-        """Open the 'Connections' filter panel (supports multiple UI variants)."""
+        """
+        Open the 'Connections' filter panel.
+        First tries a dedicated 'Connections' pill; if not present, opens the All filters modal.
+        """
         p = self.page; assert p
         nav = self._filters_nav()
 
         self.log("[filters] open 'Connections' filter")
 
-        # Variant A: a pill/tab “Connections”
+        # Variant A: a pill/tab “Connections” directly on the bar
         try:
-            btn = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I))
-            await btn.first.wait_for(timeout=2500)
-            await btn.first.click()
-            await self._shot("connections-pill-open")
-            return
+            # Try several ways to find it
+            cand = None
+            try:
+                cand = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I)).first
+                await cand.wait_for(timeout=1500)
+            except Exception:
+                pass
+            if not cand or not await cand.count():
+                cand = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
+            if cand and await cand.count():
+                await cand.scroll_into_view_if_needed()
+                await cand.click()
+                await self._shot("connections-pill-open")
+                return
         except Exception:
             pass
 
-        # Variant A2: data attribute
+        # Variant B: no pill → open All filters modal (robust)
+        self.log("[filters] 'Connections' pill not visible → opening All filters modal")
+        dlg = await self._open_all_filters()
+        await self._shot("all-filters-open")
+
+        # Best-effort: make sure the Connections section is in view in the modal
         try:
-            pill = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
-            await pill.wait_for(timeout=2000)
-            await pill.click()
-            await self._shot("connections-pill-dataattr")
-            return
+            conn_head = dlg.get_by_role("heading", name=re.compile(r"\bConnections\b", re.I)).first
+            if await conn_head.count():
+                await conn_head.scroll_into_view_if_needed()
+                await p.wait_for_timeout(150)
         except Exception:
             pass
 
-        # Variant B: aria-label contains “Connections”
+    async def _open_all_filters(self):
+        """
+        Open the 'All filters' modal robustly and return a locator for the dialog root.
+        """
+        p = self.page; assert p
+
+        # Ensure the toolbar is scrolled into view so the button is interactable
+        nav = self._filters_nav()
         try:
-            btn = nav.locator("button[aria-label*='Connections' i]").first
-            await btn.wait_for(timeout=2500)
-            await btn.click()
-            await self._shot("connections-aria-open")
-            return
+            await nav.scroll_into_view_if_needed()
         except Exception:
             pass
 
-        # Variant C: 'All filters' then ensure Connections section shows
-        self.log("[filters] try via 'All filters']")
-        try:
-            allf = nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I))
-            await allf.first.wait_for(timeout=3000)
-            await allf.first.click()
-            await self._shot("all-filters-open")
+        # Try multiple selectors (scoped + global) for the All filters button
+        candidates = [
+            nav.locator("button.search-reusables__all-filters-pill-button").first,
+            p.locator("button.search-reusables__all-filters-pill-button").first,
+            nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first,
+            p.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first,
+        ]
 
-            head = p.get_by_role("heading", name=re.compile(r"\bConnections\b", re.I))
-            await head.first.wait_for(timeout=5000)
-            await self._shot("all-filters-connections-visible")
-            return
-        except Exception as e:
-            self.log(f"[filters] could not open connections via All filters: {e}")
-            await self._shot("connections-open-failed")
-            raise
+        btn = None
+        for cand in candidates:
+            try:
+                if await cand.count():
+                    btn = cand
+                    break
+            except Exception:
+                continue
+
+        if not btn:
+            await self._shot("all-filters-button-not-found")
+            raise TimeoutError("Could not find 'All filters' button")
+
+        # Click without over-constraining visibility
+        try:
+            await btn.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await btn.wait_for(state="attached", timeout=4000)
+        except Exception:
+            pass
+        await btn.click()
+
+        # Wait for the modal/dialog to render
+        dlg_selectors = [
+            "div[role='dialog'][data-test-reusables-filters-modal]",
+            "div[role='dialog'][aria-label*='filter' i]",
+            "div[role='dialog']",
+        ]
+        dlg = None
+        for sel in dlg_selectors:
+            candidate = p.locator(sel).last
+            try:
+                await candidate.wait_for(state="visible", timeout=5000)
+                dlg = candidate
+                break
+            except Exception:
+                continue
+
+        if not dlg:
+            await self._shot("all-filters-dialog-not-found")
+            raise TimeoutError("All filters dialog did not open")
+
+        return dlg
+
 
     async def _select_second_degree(self) -> None:
         p = self.page
@@ -967,8 +1024,9 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # (3) If neither variant is present, let the caller fall back to All filters.
-        raise TimeoutError("Neither multiselect pills nor legacy toolbar radios found")
+        # (3) Neither variant is present → open modal path and let the caller reuse its selection flow
+        self.log("[filters] neither pill nor legacy toolbar found → using All filters modal")
+        await self._open_connections_filter()
 
     async def _click_companies_tab_simple(self) -> None:
         p = self.page
