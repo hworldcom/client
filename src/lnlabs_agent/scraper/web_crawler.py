@@ -176,7 +176,6 @@ class WebCrawler(SecureCookieMixin):
         self.page.on("console", _on_console)
         self.log("[session] browser ready (handlers attached)")
 
-
     # ---------- playwright context ----------
     async def _prepare_context(self, headless: bool):
         # announce paths up front (visible in GUI log)
@@ -577,23 +576,31 @@ class WebCrawler(SecureCookieMixin):
 
         raise TimeoutError("Could not find a visible global search input in either header variant.")
 
+    # ---------- filters helpers (new) ----------
+    def _filters_nav(self):
+        """Scope to the 'Search filters' nav on results pages."""
+        return self.page.locator("nav[aria-label='Search filters']").first
 
     async def _open_connections_filter(self) -> None:
-        p = self.page
-        assert p
+        """Open the 'Connections' filter panel (supports multiple UI variants)."""
+        p = self.page; assert p
+        nav = self._filters_nav()
 
-        self.log("[filters] try open 'Connections' pill by role")
+        self.log("[filters] open 'Connections' filter")
+
+        # Variant A: a pill/tab “Connections”
         try:
-            btn = p.get_by_role("button", name=lambda n: n and "connections" in n.lower())
-            await btn.wait_for(timeout=3000)
-            await btn.click()
+            btn = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I))
+            await btn.first.wait_for(timeout=2500)
+            await btn.first.click()
             await self._shot("connections-pill-open")
             return
         except Exception:
             pass
 
+        # Variant A2: data attribute
         try:
-            pill = p.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']")
+            pill = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
             await pill.wait_for(timeout=2000)
             await pill.click()
             await self._shot("connections-pill-dataattr")
@@ -601,25 +608,30 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        # Variant B: aria-label contains “Connections”
         try:
-            btn = p.locator("button[aria-label*='Connections' i]")
-            await btn.first.wait_for(timeout=3000)
-            await btn.first.click()
+            btn = nav.locator("button[aria-label*='Connections' i]").first
+            await btn.wait_for(timeout=2500)
+            await btn.click()
             await self._shot("connections-aria-open")
             return
         except Exception:
             pass
 
+        # Variant C: 'All filters' then ensure Connections section shows
         self.log("[filters] try via 'All filters'")
         try:
-            allf = p.get_by_role("button", name=lambda n: n and "all filters" in n.lower())
-            await allf.click()
+            allf = nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I))
+            await allf.first.wait_for(timeout=3000)
+            await allf.first.click()
             await self._shot("all-filters-open")
-            await p.get_by_role("heading", name=lambda n: n and "connections" in n.lower()).wait_for(timeout=5000)
+
+            head = p.get_by_role("heading", name=re.compile(r"\bConnections\b", re.I))
+            await head.first.wait_for(timeout=5000)
             await self._shot("all-filters-connections-visible")
             return
         except Exception as e:
-            self.log(f"[filters] could not open connections: {e}")
+            self.log(f"[filters] could not open connections via All filters: {e}")
             await self._shot("connections-open-failed")
             raise
 
@@ -629,8 +641,9 @@ class WebCrawler(SecureCookieMixin):
 
         self.log("[filters] selecting 2nd-degree")
 
+        # radio by name (regex)
         try:
-            radio = p.get_by_role("radio", name=lambda n: n and n.strip().startswith("2nd"))
+            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd", re.I))
             await radio.wait_for(timeout=2500)
             await radio.click()
             await self._shot("2nd-selected-radio")
@@ -638,15 +651,17 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        # aria-label button
         try:
-            btn = p.locator("button[aria-label='2nd']")
-            await btn.first.wait_for(timeout=2500)
-            await btn.first.click()
+            btn = p.locator("button[aria-label='2nd']").first
+            await btn.wait_for(timeout=2500)
+            await btn.click()
             await self._shot("2nd-selected-button")
             return
         except Exception:
             pass
 
+        # label “2nd”
         try:
             lab = p.get_by_label("2nd")
             await lab.wait_for(timeout=2500)
@@ -656,10 +671,11 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        # generic label text
         try:
-            lab = p.locator("label", has_text="2nd")
-            await lab.first.wait_for(timeout=2500)
-            await lab.first.click()
+            lab = p.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
+            await lab.wait_for(timeout=2500)
+            await lab.click()
             await self._shot("2nd-selected-generic-label")
             return
         except Exception:
@@ -672,56 +688,46 @@ class WebCrawler(SecureCookieMixin):
         p = self.page
         assert p
         try:
-            btn = p.get_by_role(
-                "button", name=lambda n: n and ("show results" in n.lower() or "apply" in n.lower())
-            )
-            await btn.wait_for(timeout=2000)
-            await btn.click()
+            btn = p.get_by_role("button", name=re.compile(r"(show\s+results|apply)", re.I))
+            await btn.first.wait_for(timeout=2000)
+            await btn.first.click()
             await self._shot("filters-applied")
         except Exception:
             pass
 
     async def _select_second_degree_toolbar_first(self) -> None:
-        p = self.page
-        assert p
-        self.log("[filters] try toolbar radios (1st/2nd/3rd+)")
+        """
+        On this UI variant, 1st/2nd/3rd+ are multiselect pills inside the Search filters nav.
+        Click the '2nd' pill there.
+        """
+        p = self.page; assert p
+        self.log("[filters] try multiselect pills for 1st/2nd/3rd+]")
 
-        toolbar = p.locator("div[role='toolbar']").first
-        await toolbar.wait_for(timeout=5000)
-        await self._shot("toolbar-present")
+        nav = self._filters_nav()
+        await nav.wait_for(timeout=7000)
 
+        # Prefer aria-label (stable)
+        btn = nav.locator(
+            "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
+        ).first
+
+        if not await btn.count():
+            # Fallback: visible text
+            btn = nav.locator(
+                "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+            ).first
+
+        await btn.scroll_into_view_if_needed()
+        await btn.wait_for(state="visible", timeout=3000)
+        await btn.click()
+
+        # Optional confirm toggled on
         try:
-            lab = toolbar.get_by_text(re.compile(r"^\s*2nd\s*$"))
-            await lab.first.scroll_into_view_if_needed()
-            await lab.first.wait_for(timeout=2500)
-            await lab.first.click()
-            await self._shot("2nd-selected-toolbar-label")
-            return
+            await btn.wait_for_function("el => el.getAttribute('aria-pressed') === 'true'", timeout=2000)
         except Exception:
             pass
 
-        try:
-            radio = toolbar.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I))
-            await radio.first.scroll_into_view_if_needed()
-            await radio.first.wait_for(timeout=2500)
-            await radio.first.click()
-            await self._shot("2nd-selected-toolbar-radio")
-            return
-        except Exception:
-            pass
-
-        try:
-            lab = toolbar.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I))
-            await lab.first.scroll_into_view_if_needed()
-            await lab.first.wait_for(timeout=2500)
-            await lab.first.click()
-            await self._shot("2nd-selected-toolbar-generic")
-            return
-        except Exception:
-            pass
-
-        await self._shot("2nd-not-found-toolbar")
-        raise TimeoutError("Toolbar radios present but could not click '2nd'")
+        await self._shot("2nd-selected-multiselect")
 
     async def _click_companies_tab_simple(self) -> None:
         p = self.page
