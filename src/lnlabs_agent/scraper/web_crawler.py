@@ -51,8 +51,10 @@ class WebCrawler(SecureCookieMixin):
         self._audit_max_bytes = 5 * 1024 * 1024  # 5MB roll
 
         # console suppression
-        self._suppress_console_re = re.compile(r"ERR_BLOCKED_BY_CLIENT")
-
+        self._suppress_console_re = re.compile(
+            r"(ERR_BLOCKED_BY_CLIENT|ERR_FAILED|VIDEOJS|MEDIA_ERR_SRC_NOT_SUPPORTED|Failed to load resource)",
+            re.I,
+        )
         # runtime objects
         self.playwright = None
         self.browser = None
@@ -114,38 +116,41 @@ class WebCrawler(SecureCookieMixin):
     def _attach_page_logging(self) -> None:
         assert self.page
 
-        def on_request_failed(req):
+        # Write network failures to the audit file (not the UI)
+        def _on_request_failed(req):
             try:
                 failure = getattr(req, "failure", None)
-                if isinstance(failure, dict):
-                    err = failure.get("errorText") or failure.get("error_text") or ""
-                elif isinstance(failure, str):
-                    err = failure
+                if failure:
+                    err = (
+                        getattr(failure, "error_text", "")
+                        or getattr(failure, "errorText", "")
+                        or str(failure)
+                    )
                 else:
-                    err = getattr(failure, "error_text", "") or getattr(failure, "errorText", "") or ""
-                # headers (best-effort)
+                    err = ""
+                # headers for referer, best-effort
+                headers = {}
                 try:
                     headers = req.headers or {}
                 except Exception:
-                    try:
-                        headers = req.all_headers()
-                    except Exception:
-                        headers = {}
+                    pass
                 ref = headers.get("referer") or headers.get("referrer") or "-"
                 self.audit(f"[failed] {req.method} {req.url} :: {err} ref={ref}")
             except Exception as e:
                 self.audit(f"[failed:handler-error] {e!r}")
 
-        def on_console(msg):
-            txt = msg.text or ""
+        # Only show non-noisy console messages in the UI; noisy ones go to audit.
+        def _on_console(msg):
+            txt = (msg.text or "").strip()
             if self._suppress_console_re.search(txt):
-                self.audit(f"[console-blocked] {msg.type} {txt}")
-                return  # do not bubble to GUI
+                self.audit(f"[console-suppressed] {msg.type} {txt}")
+                return
             self.log(f"[page.console] {msg.type} {txt}")
 
-        self.page.on("requestfailed", on_request_failed)
-        self.page.on("console", on_console)
-        self.log("[session] browser ready")
+        self.page.on("requestfailed", _on_request_failed)
+        self.page.on("console", _on_console)
+        self.log("[session] browser ready (console/network handlers attached)")
+
 
     # ---------- playwright context ----------
     async def _prepare_context(self, headless: bool):
