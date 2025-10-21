@@ -324,14 +324,31 @@ class WebCrawler(SecureCookieMixin):
 
     async def _extract_data_urls_names_company(self, company: str, out_names: list[str], out_urls: list[str]):
         self.log("[step] locate search box")
-        search_box = await self.locate(".search-global-typeahead input")
+        search_box = await self._find_global_search_input()
         await self._shot("search-box")
-        await self.click(search_box)
+        # Focus & clear any previous query
+        try:
+            await search_box.click()
+        except Exception:
+            # if covered by overlay, try to ensure it’s open and click again
+            await self._ensure_search_box_open()
+            await search_box.click()
+
+        # Clear text robustly (fill is best; fallback to Ctrl/Meta+A + Backspace)
+        try:
+            await search_box.fill("")
+        except Exception:
+            try:
+                # macOS uses Meta; Windows/Linux use Control—send both safely
+                await self.page.keyboard.press("Meta+A")
+                await self.page.keyboard.press("Backspace")
+            except Exception:
+                pass
 
         self.log(f"[step] typing query: {company}")
-        await self.type(company)
+        await search_box.type(company, delay=50)
         await self.press_enter()
-        await self.page.wait_for_timeout(5_000)
+        await self.page.wait_for_timeout(1500)
         await self._shot("after-enter")
 
         await self._click_companies_tab_simple()
@@ -426,6 +443,79 @@ class WebCrawler(SecureCookieMixin):
             self.log(f"[page{page_i}] next → {page_i + 1}")
             await page.wait_for_timeout(600)
             page_i += 1
+
+    async def _ensure_search_box_open(self) -> None:
+        """If the search box is collapsed, expand it."""
+        p = self.page; assert p
+        try:
+            # Classic header: collapsed button
+            btn = p.locator("button.search-global-typeahead__collapsed-search-button").first
+            if await btn.count() and not await p.locator("#global-nav-search input").first.is_visible():
+                await btn.click()
+                await p.wait_for_timeout(200)
+                return
+        except Exception:
+            pass
+        # New UI doesn't always collapse; nothing to do.
+
+    async def _find_global_search_input(self):
+        """
+        Return a locator for the search input across both nav variants.
+        Prefers *visible* inputs.
+        """
+        p = self.page; assert p
+
+        # Candidate selectors, ordered by likelihood.
+        candidates = [
+            # Home / classic header
+            "#global-nav-search input.search-global-typeahead__input",
+            "header#global-nav input.search-global-typeahead__input",
+            "header#global-nav input[role='combobox'][aria-autocomplete='list']",
+            "input[data-view-name='search-global-typeahead-input']",
+
+            # Results page / new header
+            "div[role='search'] input[data-testid='typeahead-input']",
+            "input[data-testid='typeahead-input']",
+            "div[role='search'] input[aria-autocomplete='list']",
+
+            # Fallback generic
+            "input[placeholder='Search']",
+            "input[aria-label='Search']",
+        ]
+
+        # Try to expand the box if it’s collapsed
+        await self._ensure_search_box_open()
+
+        # Return the first visible candidate
+        for sel in candidates:
+            loc = p.locator(sel).first
+            try:
+                if await loc.count():
+                    # Wait briefly for visibility if it's likely the right thing
+                    try:
+                        await loc.wait_for(state="visible", timeout=800)
+                        return loc
+                    except Exception:
+                        # If not visible yet, still consider if it *becomes* visible after small delay
+                        await p.wait_for_timeout(150)
+                        if await loc.is_visible():
+                            return loc
+            except Exception:
+                continue
+
+        # Last resort: press "/" which focuses search on some UIs, then re-scan quickly
+        try:
+            await p.keyboard.press("/")
+            await p.wait_for_timeout(150)
+            for sel in candidates:
+                loc = p.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    return loc
+        except Exception:
+            pass
+
+        raise TimeoutError("Could not find a visible global search input in either header variant.")
+
 
     async def _open_connections_filter(self) -> None:
         p = self.page
