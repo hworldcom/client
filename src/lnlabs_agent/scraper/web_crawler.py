@@ -8,10 +8,12 @@ from typing import Optional, Callable, List
 from datetime import datetime
 
 from playwright.async_api import async_playwright
-from platformdirs import user_log_dir
+from platformdirs import user_log_dir, user_config_dir
+
+from lnlabs_agent.secure_cookies import SecureCookieMixin
 
 
-class WebCrawler:
+class WebCrawler(SecureCookieMixin):
     def __init__(
         self,
         base_url: str = "https://www.linkedin.com/",
@@ -24,14 +26,22 @@ class WebCrawler:
         verbose_network: bool = True,
     ):
         self.URL = base_url.rstrip("/") + "/"
-        self.COOKIE_FILE = cookie_file
         self.WINDOW_OFFSET = window_offset
         self.browser_exe = browser_exe
         self.log = logger or (lambda s: None)
         self.verbose_network = verbose_network
 
+        # --- cookie path (absolute) ---
+        app_conf = Path(user_config_dir("LNLabsAgent", "LNLabs"))
+        app_conf.mkdir(parents=True, exist_ok=True)
+        self.COOKIE_FILE = (
+            str(Path(cookie_file).expanduser().resolve())
+            if os.path.isabs(cookie_file)
+            else str((app_conf / cookie_file).resolve())
+        )
+
         # screenshots / small artifacts
-        self.artifacts_dir = Path(artifacts_dir or ".artifacts")
+        self.artifacts_dir = Path(artifacts_dir or (app_conf / "artifacts"))
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
         # file audit log (blocked/failed requests, filtered console)
@@ -49,10 +59,8 @@ class WebCrawler:
         self.context = None
         self.page = None
 
-
     def _abs(self, p: os.PathLike | str) -> Path:
         return Path(p).expanduser().resolve()
-
 
     # ---------- screenshots ----------
     async def _shot(self, name: str) -> None:
@@ -89,14 +97,10 @@ class WebCrawler:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists() and path.stat().st_size > self._audit_max_bytes:
                 b = path.with_suffix(".log.1")
-                try:
-                    b.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                try:
-                    path.rename(b)
-                except Exception:
-                    pass
+                try: b.unlink(missing_ok=True)
+                except Exception: pass
+                try: path.rename(b)
+                except Exception: pass
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             path.open("a", encoding="utf-8").write(f"{ts} {line}\n")
         except Exception:
@@ -110,30 +114,28 @@ class WebCrawler:
     def _attach_page_logging(self) -> None:
         assert self.page
 
-        # network failures (includes exact URL + error)
-    def on_request_failed(self, req):
-        try:
-            failure = getattr(req, "failure", None)
-            if isinstance(failure, dict):
-                err = failure.get("errorText") or failure.get("error_text") or ""
-            elif isinstance(failure, str):
-                err = failure
-            else:
-                err = getattr(failure, "error_text", "") or getattr(failure, "errorText", "") or ""
-            # headers
+        def on_request_failed(req):
             try:
-                headers = req.headers or {}
-            except Exception:
+                failure = getattr(req, "failure", None)
+                if isinstance(failure, dict):
+                    err = failure.get("errorText") or failure.get("error_text") or ""
+                elif isinstance(failure, str):
+                    err = failure
+                else:
+                    err = getattr(failure, "error_text", "") or getattr(failure, "errorText", "") or ""
+                # headers (best-effort)
                 try:
-                    headers = req.all_headers()
+                    headers = req.headers or {}
                 except Exception:
-                    headers = {}
-            ref = headers.get("referer") or headers.get("referrer") or "-"
-            self.audit(f"[failed] {req.method} {req.url} :: {err} ref={ref}")
-        except Exception as e:
-            self.audit(f"[failed:handler-error] {e!r}")
+                    try:
+                        headers = req.all_headers()
+                    except Exception:
+                        headers = {}
+                ref = headers.get("referer") or headers.get("referrer") or "-"
+                self.audit(f"[failed] {req.method} {req.url} :: {err} ref={ref}")
+            except Exception as e:
+                self.audit(f"[failed:handler-error] {e!r}")
 
-        # console messages — suppress ERR_BLOCKED_BY_CLIENT in GUI, but keep in audit
         def on_console(msg):
             txt = msg.text or ""
             if self._suppress_console_re.search(txt):
@@ -141,7 +143,7 @@ class WebCrawler:
                 return  # do not bubble to GUI
             self.log(f"[page.console] {msg.type} {txt}")
 
-        self.page.on("requestfailed", self.on_request_failed)
+        self.page.on("requestfailed", on_request_failed)
         self.page.on("console", on_console)
         self.log("[session] browser ready")
 
@@ -177,29 +179,18 @@ class WebCrawler:
 
         await self.context.route("**/*", router)
 
-        # cookies
-        if os.path.exists(self.COOKIE_FILE):
-            try:
-                with open(self.COOKIE_FILE, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                await self.context.add_cookies(cookies)
-            except Exception:
-                pass
+        # cookies (secure mixin)
+        await self._load_cookies()
 
         self.page = await self.context.new_page()
         self._attach_page_logging()
 
-        self.log("[session] browser ready")
-
     async def _teardown_context(self):
         try:
             if self.context:
-                # save cookies best-effort (with logging)
+                # secure save via mixin (with perms + path logging)
                 try:
-                    cookies = await self.context.cookies()
-                    with open(self.COOKIE_FILE, "w", encoding="utf-8") as f:
-                        json.dump(cookies, f)
-                    self.log(f"[cookies] saved → {self._abs(self.COOKIE_FILE)} ({len(cookies)} items)")
+                    await self._save_cookies()
                 except Exception as e:
                     self.log(f"[cookies] save failed: {e}")
                 await self.context.close()
@@ -256,32 +247,6 @@ class WebCrawler:
             return bool(meta_tag and meta_tag.startswith("auth_wall"))
         except Exception:
             return False
-
-    # --- cookie helpers now log paths explicitly ---
-    async def _load_cookies(self) -> None:
-        assert self.context
-        p = self._abs(self.COOKIE_FILE)
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                await self.context.add_cookies(cookies)
-                self.log(f"[cookies] loaded ← {p} ({len(cookies)} items)")
-            except Exception as e:
-                self.log(f"[cookies] load failed from {p}: {e}")
-        else:
-            self.log(f"[cookies] none found at {p}")
-
-
-    async def _save_cookies(self) -> None:
-        assert self.context
-        try:
-            cookies = await self.context.cookies()
-            with open(self.COOKIE_FILE, "w", encoding="utf-8") as f:
-                json.dump(cookies, f)
-            print("Saved cookies.")
-        except Exception as e:
-            print(f"Cookie save failed: {e}")
 
     # -------- navigation primitives --------
     async def safe_goto(self, url: str, max_retries: int = 3) -> bool:

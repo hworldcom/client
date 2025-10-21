@@ -304,6 +304,7 @@ class AgentRunner(threading.Thread):
         crawler = WebCrawler(
             logger=self.log,
             artifacts_dir=ARTIFACTS_DIR,
+            cookie_file=COOKIE_FILE,
             # You can pass browser_exe if you want to force a specific binary:
             # browser_exe=_chromium_exe_from_cache(BROWSERS_DIR),
         )
