@@ -50,11 +50,18 @@ class WebCrawler(SecureCookieMixin):
         self.audit_log_path = Path(audit_log_path or (default_dir / "network.log"))
         self._audit_max_bytes = 5 * 1024 * 1024  # 5MB roll
 
-        # console suppression
+        # Only surface console logs from these origins (everything else goes to audit file)
+        self._console_allow_origin = re.compile(r"https?://([^/]*\.)?linkedin\.com/", re.I)
+
+        # Suppress these noisy console messages in the UI (but still record to audit)
         self._suppress_console_re = re.compile(
-            r"(ERR_BLOCKED_BY_CLIENT|ERR_FAILED|VIDEOJS|MEDIA_ERR_SRC_NOT_SUPPORTED|Failed to load resource)",
+            r"(?:"
+            r"ERR_BLOCKED_BY_CLIENT|ERR_FAILED|MEDIA_ERR_SRC_NOT_SUPPORTED|Failed to load resource|"
+            r"VIDEOJS|%c\s|console\.groupEnd|EvalError"
+            r")",
             re.I,
         )
+
         # runtime objects
         self.playwright = None
         self.browser = None
@@ -116,7 +123,7 @@ class WebCrawler(SecureCookieMixin):
     def _attach_page_logging(self) -> None:
         assert self.page
 
-        # Write network failures to the audit file (not the UI)
+        # --- requestfailed → always audit ---
         def _on_request_failed(req):
             try:
                 failure = getattr(req, "failure", None)
@@ -128,7 +135,7 @@ class WebCrawler(SecureCookieMixin):
                     )
                 else:
                     err = ""
-                # headers for referer, best-effort
+                # best-effort referer
                 headers = {}
                 try:
                     headers = req.headers or {}
@@ -139,17 +146,35 @@ class WebCrawler(SecureCookieMixin):
             except Exception as e:
                 self.audit(f"[failed:handler-error] {e!r}")
 
-        # Only show non-noisy console messages in the UI; noisy ones go to audit.
+        # --- console → UI only for LinkedIn origin AND not noisy; always audit ---
         def _on_console(msg):
             txt = (msg.text or "").strip()
-            if self._suppress_console_re.search(txt):
-                self.audit(f"[console-suppressed] {msg.type} {txt}")
+            loc = {}
+            try:
+                loc = msg.location or {}
+            except Exception:
+                pass
+            url = (loc.get("url") or "").strip()
+            line = loc.get("lineNumber")
+            col  = loc.get("columnNumber")
+
+            # Always write full console lines to audit with origin/position
+            self.audit(f"[console] {msg.type} {url}:{line}:{col} :: {txt}")
+
+            # 1) If console did not originate from LinkedIn → hide from UI
+            if url and not self._console_allow_origin.search(url):
                 return
+
+            # 2) If text matches known noisy patterns → hide from UI
+            if self._suppress_console_re.search(txt):
+                return
+
+            # Otherwise show to UI
             self.log(f"[page.console] {msg.type} {txt}")
 
         self.page.on("requestfailed", _on_request_failed)
         self.page.on("console", _on_console)
-        self.log("[session] browser ready (console/network handlers attached)")
+        self.log("[session] browser ready (handlers attached)")
 
 
     # ---------- playwright context ----------
