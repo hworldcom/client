@@ -86,10 +86,26 @@ SELECTORS = {
         "button.search-global-typeahead__collapsed-search-button",
     ],
     # --- Company page ---
+    "company_top_card": [
+        "div.org-top-card-summary-info-list",     # the container you pasted
+        "section.org-top-card",                   # alt containers seen in AB tests
+        "div.org-top-card__primary-content",
+    ],
+
     "company_employees_link": [
-        "div.org-top-card-summary-info-list div.inline-block >> a:has(span:has-text('employees'))",
-        "a:has(span:has-text('employees'))",
+        # Exact class on the anchor you pasted:
+        "div.org-top-card-summary-info-list a.org-top-card-summary-info-list__info-item-link",
+        "a.org-top-card-summary-info-list__info-item-link",
+
+        # Very common canned-search pattern from company pages:
+        "a[href*='currentCompany=']",
+        "a[href*='/search/results/people/?currentCompany=']",
+
+        # Generic fallbacks:
+        "a[href$='/people/']",
         "a[href*='/people/']",
+        "a:has(span:has-text('employees'))",
+        "a:has-text('employees')",
     ],
     # --- Pagination ---
     "pagination_container": [
@@ -727,13 +743,7 @@ class WebCrawler(SecureCookieMixin):
         await self._shot("company-opened")
         await self.page.wait_for_timeout(1200)
         self.log("[step] open employees")
-        employee_button = await self._first_present("company_employees_link")
-        if not employee_button:
-            await self._shot("employees-link-missing")
-            raise TimeoutError("Employees link not found on company page")
-        await self._shot("employees-link")
-        await self.click(employee_button)
-        await self.page.wait_for_load_state("domcontentloaded")
+        await self._open_company_employees()
 
         self.log("[step] filter 2nd-degree (simple toolbar click)]")
         ok = await self._click_second_degree_simple(timeout_ms=15_000)
@@ -1430,3 +1440,77 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 return None
         return None
+
+
+    async def _open_company_employees(self) -> None:
+        """
+        Wait for the company top card to hydrate, then click the 'employees' link.
+        Handles multiple UI variants:
+          - <a class="org-top-card-summary-info-list__info-item-link" ...>
+          - canned search links with ?currentCompany=...
+          - /people/ links
+          - anchors whose visible text/span includes 'employees'
+        """
+        p = self.page; assert p
+
+        # Wait for either the top card to appear or the link itself
+        try:
+            await p.wait_for_selector(
+                _join(SELECTORS["company_top_card"]) + ", " + _join(SELECTORS["company_employees_link"]),
+                timeout=10_000
+            )
+        except Exception:
+            # keep going; we'll still try to find the link
+            pass
+
+        # Small retry window in case the top card content hydrates a beat later
+        last_err = None
+        for _ in range(5):
+            try:
+                # Prefer the most specific/intent-revealing anchors first
+                priority_order = [
+                    "a[href*='/search/results/people/?currentCompany=']",
+                    "a[href*='currentCompany=']",
+                    "div.org-top-card-summary-info-list a.org-top-card-summary-info-list__info-item-link",
+                    "a.org-top-card-summary-info-list__info-item-link",
+                    "a[href$='/people/']",
+                    "a[href*='/people/']",
+                    "a:has(span:has-text('employees'))",
+                    "a:has-text('employees')",
+                ]
+
+                btn = None
+                for sel in priority_order:
+                    cand = p.locator(sel).first
+                    try:
+                        if await cand.count():
+                            btn = cand
+                            break
+                    except Exception:
+                        continue
+
+                if not btn:
+                    raise RuntimeError("Employees link not present (yet)")
+
+                # Scroll into view and click
+                try:
+                    await btn.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    await btn.wait_for(state="visible", timeout=1500)
+                except Exception:
+                    # Some variants are present but not strictly 'visible' — still try click
+                    pass
+
+                if not await self.click_with_retry(btn, attempts=3, delay_ms=180):
+                    raise RuntimeError("Employees link click failed")
+
+                await p.wait_for_load_state("domcontentloaded")
+                return
+            except Exception as e:
+                last_err = e
+                await p.wait_for_timeout(500)
+
+        await self._shot("employees-link-missing")
+        raise TimeoutError(f"Employees link not found on company page: {last_err}")
