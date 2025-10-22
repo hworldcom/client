@@ -898,27 +898,16 @@ class WebCrawler(SecureCookieMixin):
         # Prefer toolbar if present and hydrated (quick win even from modal path)
         try:
             await self._wait_filters_toolbar_hydrated(timeout_ms=10_000)
-            tb = p.locator("div[role='toolbar']").first
-            if await tb.count():
-                radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
-                if await radio.count():
-                    await self.click(radio)
-                    await self._shot("2nd-selected-radio")
-                    await self.wait_network_quiet()
-                    return
-                sdui_label = tb.locator("label", has_text=SECOND_RX).first
-                if await sdui_label.count():
-                    await self.click(sdui_label)
-                    await self._shot("2nd-selected-sdui-label")
-                    await self.wait_network_quiet()
-                    return
         except Exception:
-            # If toolbar not there, proceed with your other fallbacks
             pass
 
-        # Original fallbacks with broadened matching:
+        ok = await self._activate_radio_by_label(SECOND_RX, scope_selector="div[role='toolbar']", timeout_ms=8_000)
+        if ok:
+            await self._shot("2nd-selected-robust")
+            await self.wait_network_quiet()
+            return
 
-        # ARIA radio by name
+        # --- your original fallbacks, unchanged (regex kept) ---
         try:
             radio = p.get_by_role("radio", name=SECOND_RX).first
             await radio.wait_for(timeout=2000)
@@ -929,7 +918,6 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # Specific ARIA-label button
         try:
             btn = p.locator("button[aria-label='2nd']").first
             await btn.wait_for(timeout=2000)
@@ -940,7 +928,6 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # Generic label with broader regex
         try:
             lab = p.locator("label", has_text=SECOND_RX).first
             await lab.wait_for(timeout=2000)
@@ -968,7 +955,6 @@ class WebCrawler(SecureCookieMixin):
         p = self.page; assert p
         self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
 
-        # Keep your original wait targets but extend the timeout a bit
         try:
             await self.wait_for_any(
                 [
@@ -982,10 +968,20 @@ class WebCrawler(SecureCookieMixin):
             await self._open_connections_filter()
             return
 
-        # Make sure the lazy filter bar is actually hydrated
-        await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
+        # Give the SDUI bar a moment to hydrate
+        try:
+            await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
+        except Exception:
+            pass
 
-        # Try working primarily inside the toolbar scope
+        # NEW: robust attempt via activator (keeps all your existing selectors as fallback)
+        ok = await self._activate_radio_by_label(SECOND_RX, scope_selector="div[role='toolbar']", timeout_ms=8_000)
+        if ok:
+            await self._shot("2nd-selected-robust")
+            await self.wait_network_quiet()
+            return
+
+        # --- your original fallbacks (unchanged except reusing SECOND_RX) ---
         tb = p.locator("div[role='toolbar']").first
         try:
             if await tb.count():
@@ -994,38 +990,23 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # 1) Preferred: click the radio container that has a label with "2nd"
-        radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
-        if await radio.count():
-            await self.click(radio)
-            await self._shot("2nd-selected-radio")
-            await self.wait_network_quiet()
-            return
-
-        # 2) Label inside toolbar (your original approach but regex loosened)
-        sdui_label = tb.locator("label", has_text=SECOND_RX).first
+        sdui_label = p.locator("div[role='toolbar'] label", has_text=SECOND_RX).first
         if await sdui_label.count():
             await self.click(sdui_label)
             await self._shot("2nd-selected-sdui-label")
             await self.wait_network_quiet()
             return
 
-        # 3) ARIA radio by accessible name (still scoped first, then global)
-        radio_scoped = tb.get_by_role("radio", name=SECOND_RX).first
-        if await radio_scoped.count():
-            await self.click(radio_scoped)
-            await self._shot("2nd-selected-aria-radio-scoped")
-            await self.wait_network_quiet()
-            return
+        try:
+            radio = p.get_by_role("radio", name=SECOND_RX).first
+            if await radio.count():
+                await self.click(radio)
+                await self._shot("2nd-selected-aria-radio")
+                await self.wait_network_quiet()
+                return
+        except Exception:
+            pass
 
-        radio_global = p.get_by_role("radio", name=SECOND_RX).first
-        if await radio_global.count():
-            await self.click(radio_global)
-            await self._shot("2nd-selected-aria-radio-global")
-            await self.wait_network_quiet()
-            return
-
-        # 4) Try the multiselect chips inside the nav (kept from your code)
         try:
             nav = self._filters_nav()
             if await nav.count():
@@ -1044,7 +1025,6 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # 5) Generic label/button fallbacks (kept, regex broadened)
         try:
             btn = p.locator("button[aria-label='2nd']").first
             if await btn.count():
@@ -1067,6 +1047,7 @@ class WebCrawler(SecureCookieMixin):
 
         self.log("[filters] toolbar chips not clickable → using All filters modal")
         await self._open_connections_filter()
+
 
     async def locate_within_scroll(self, text, MAX_SCROLLS=5, DELAY=1):
         for i in range(MAX_SCROLLS):
@@ -1240,3 +1221,112 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             # Some variants render as buttons/labels first; just let the caller proceed.
             pass
+
+    async def _activate_radio_by_label(self, label_regex: re.Pattern, scope_selector: str = "div[role='toolbar']", timeout_ms: int = 8_000) -> bool:
+        """
+        Robustly activate a 'radio' option in the toolbar by its visible label text.
+        Tries multiple strategies and verifies aria-checked becomes true.
+        """
+        p = self.page; assert p
+
+        # 1) Find label in the scope
+        scope = p.locator(scope_selector).first
+        if await scope.count():
+            try:
+                await scope.scroll_into_view_if_needed()
+                await p.wait_for_timeout(120)
+            except Exception:
+                pass
+        else:
+            scope = p  # fall back to page
+
+        label = scope.locator("label").filter(has_text=label_regex).first
+        if not await label.count():
+            # Try any toolbar label again after a small wait; hydration can be late
+            try:
+                await p.wait_for_timeout(200)
+            except Exception:
+                pass
+            label = scope.locator("label").filter(has_text=label_regex).first
+            if not await label.count():
+                return False
+
+        # 2) Find containing radio and for/id input
+        radio = label.locator("xpath=ancestor::*[@role='radio'][1]").first
+        input_id = await label.get_attribute("for")
+        input_by_for = p.locator(f'#{input_id}') if input_id else None
+
+        async def _is_selected() -> bool:
+            try:
+                # Prefer aria-checked on the radio container
+                if await radio.count():
+                    val = await radio.get_attribute("aria-checked")
+                    if (val or "").lower() == "true":
+                        return True
+                # Fallback: if input exists and is checked
+                if input_by_for and await input_by_for.count():
+                    return await input_by_for.is_checked()
+            except Exception:
+                pass
+            return False
+
+        # Fast path: already selected
+        if await _is_selected():
+            return True
+
+        # Strategy 1: click the visible label
+        try:
+            await label.click()
+            if await _is_selected():
+                return True
+        except Exception:
+            pass
+
+        # Strategy 2: click the radio container itself
+        if await radio.count():
+            try:
+                await radio.click()
+                if await _is_selected():
+                    return True
+            except Exception:
+                pass
+
+            # Strategy 3: keyboard Space on container (ARIA radios should toggle on Space)
+            try:
+                await radio.focus()
+                await p.keyboard.press("Space")
+                if await _is_selected():
+                    return True
+            except Exception:
+                pass
+
+            # Strategy 4: JS click on the radio element (bypasses hit-target issues)
+            try:
+                await p.evaluate("(el) => el.click()", radio)
+                if await _is_selected():
+                    return True
+            except Exception:
+                pass
+
+        # Strategy 5: operate on the associated input (ensures change/input events)
+        try:
+            # get_by_label wires the <label for> properly even if input is offset/hidden
+            ctrl = p.get_by_label(label_regex).first
+            if await ctrl.count():
+                # try Playwright's semantic action
+                await ctrl.check(force=True)
+                if await _is_selected():
+                    return True
+        except Exception:
+            pass
+
+        # Strategy 6: last resort — force click on label again (different hit area)
+        try:
+            await label.click(force=True)
+            if await _is_selected():
+                return True
+        except Exception:
+            pass
+
+        return False
+
