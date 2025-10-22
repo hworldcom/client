@@ -725,7 +725,7 @@ class WebCrawler(SecureCookieMixin):
         await self.click(a_tag)
         await self.page.wait_for_load_state("domcontentloaded")
         await self._shot("company-opened")
-
+        await self.page.wait_for_timeout(1200)
         self.log("[step] open employees")
         employee_button = await self._first_present("company_employees_link")
         if not employee_button:
