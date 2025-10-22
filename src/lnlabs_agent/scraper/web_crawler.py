@@ -964,109 +964,109 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-async def _select_second_degree_toolbar_first(self) -> None:
-    p = self.page; assert p
-    self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
+    async def _select_second_degree_toolbar_first(self) -> None:
+        p = self.page; assert p
+        self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
 
-    # Keep your original wait targets but extend the timeout a bit
-    try:
-        await self.wait_for_any(
-            [
-                "nav[aria-label='Search filters']",
-                "div[role='toolbar']",
-            ],
-            timeout=15_000,
-        )
-    except Exception:
-        self.log("[filters] no toolbar/nav attached yet")
-        await self._open_connections_filter()
-        return
+        # Keep your original wait targets but extend the timeout a bit
+        try:
+            await self.wait_for_any(
+                [
+                    "nav[aria-label='Search filters']",
+                    "div[role='toolbar']",
+                ],
+                timeout=15_000,
+            )
+        except Exception:
+            self.log("[filters] no toolbar/nav attached yet")
+            await self._open_connections_filter()
+            return
 
-    # Make sure the lazy filter bar is actually hydrated
-    await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
+        # Make sure the lazy filter bar is actually hydrated
+        await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
 
-    # Try working primarily inside the toolbar scope
-    tb = p.locator("div[role='toolbar']").first
-    try:
-        if await tb.count():
-            await tb.scroll_into_view_if_needed()
-            await p.wait_for_timeout(120)
-    except Exception:
-        pass
+        # Try working primarily inside the toolbar scope
+        tb = p.locator("div[role='toolbar']").first
+        try:
+            if await tb.count():
+                await tb.scroll_into_view_if_needed()
+                await p.wait_for_timeout(120)
+        except Exception:
+            pass
 
-    # 1) Preferred: click the radio container that has a label with "2nd"
-    radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
-    if await radio.count():
-        await self.click(radio)
-        await self._shot("2nd-selected-radio")
-        await self.wait_network_quiet()
-        return
+        # 1) Preferred: click the radio container that has a label with "2nd"
+        radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
+        if await radio.count():
+            await self.click(radio)
+            await self._shot("2nd-selected-radio")
+            await self.wait_network_quiet()
+            return
 
-    # 2) Label inside toolbar (your original approach but regex loosened)
-    sdui_label = tb.locator("label", has_text=SECOND_RX).first
-    if await sdui_label.count():
-        await self.click(sdui_label)
-        await self._shot("2nd-selected-sdui-label")
-        await self.wait_network_quiet()
-        return
+        # 2) Label inside toolbar (your original approach but regex loosened)
+        sdui_label = tb.locator("label", has_text=SECOND_RX).first
+        if await sdui_label.count():
+            await self.click(sdui_label)
+            await self._shot("2nd-selected-sdui-label")
+            await self.wait_network_quiet()
+            return
 
-    # 3) ARIA radio by accessible name (still scoped first, then global)
-    radio_scoped = tb.get_by_role("radio", name=SECOND_RX).first
-    if await radio_scoped.count():
-        await self.click(radio_scoped)
-        await self._shot("2nd-selected-aria-radio-scoped")
-        await self.wait_network_quiet()
-        return
+        # 3) ARIA radio by accessible name (still scoped first, then global)
+        radio_scoped = tb.get_by_role("radio", name=SECOND_RX).first
+        if await radio_scoped.count():
+            await self.click(radio_scoped)
+            await self._shot("2nd-selected-aria-radio-scoped")
+            await self.wait_network_quiet()
+            return
 
-    radio_global = p.get_by_role("radio", name=SECOND_RX).first
-    if await radio_global.count():
-        await self.click(radio_global)
-        await self._shot("2nd-selected-aria-radio-global")
-        await self.wait_network_quiet()
-        return
+        radio_global = p.get_by_role("radio", name=SECOND_RX).first
+        if await radio_global.count():
+            await self.click(radio_global)
+            await self._shot("2nd-selected-aria-radio-global")
+            await self.wait_network_quiet()
+            return
 
-    # 4) Try the multiselect chips inside the nav (kept from your code)
-    try:
-        nav = self._filters_nav()
-        if await nav.count():
-            btn = nav.locator(
-                "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
-            ).first
-            if not await btn.count():
+        # 4) Try the multiselect chips inside the nav (kept from your code)
+        try:
+            nav = self._filters_nav()
+            if await nav.count():
                 btn = nav.locator(
-                    "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+                    "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
                 ).first
+                if not await btn.count():
+                    btn = nav.locator(
+                        "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+                    ).first
+                if await btn.count():
+                    await self.click(btn)
+                    await self._shot("2nd-selected-multiselect")
+                    await self.wait_network_quiet()
+                    return
+        except Exception:
+            pass
+
+        # 5) Generic label/button fallbacks (kept, regex broadened)
+        try:
+            btn = p.locator("button[aria-label='2nd']").first
             if await btn.count():
                 await self.click(btn)
-                await self._shot("2nd-selected-multiselect")
+                await self._shot("2nd-selected-button")
                 await self.wait_network_quiet()
                 return
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 5) Generic label/button fallbacks (kept, regex broadened)
-    try:
-        btn = p.locator("button[aria-label='2nd']").first
-        if await btn.count():
-            await self.click(btn)
-            await self._shot("2nd-selected-button")
-            await self.wait_network_quiet()
-            return
-    except Exception:
-        pass
+        try:
+            lab = p.locator("label", has_text=SECOND_RX).first
+            if await lab.count():
+                await lab.click(force=True)
+                await self._shot("2nd-selected-generic-label")
+                await self.wait_network_quiet()
+                return
+        except Exception:
+            pass
 
-    try:
-        lab = p.locator("label", has_text=SECOND_RX).first
-        if await lab.count():
-            await lab.click(force=True)
-            await self._shot("2nd-selected-generic-label")
-            await self.wait_network_quiet()
-            return
-    except Exception:
-        pass
-
-    self.log("[filters] toolbar chips not clickable → using All filters modal")
-    await self._open_connections_filter()
+        self.log("[filters] toolbar chips not clickable → using All filters modal")
+        await self._open_connections_filter()
 
     async def locate_within_scroll(self, text, MAX_SCROLLS=5, DELAY=1):
         for i in range(MAX_SCROLLS):
