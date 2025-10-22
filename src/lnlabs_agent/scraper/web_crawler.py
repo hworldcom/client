@@ -761,7 +761,7 @@ class WebCrawler(SecureCookieMixin):
         await self.page.wait_for_timeout(1200)
         self.log("[step] open employees")
         await self._open_company_employees()
-        await self.page.wait_for_timeout(2000)
+        await self.page.wait_for_timeout(20000)
 
         self.log("[step] filter 2nd-degree (simple toolbar click)]")
         ok = await self._click_second_degree_simple(timeout_ms=15_000)
