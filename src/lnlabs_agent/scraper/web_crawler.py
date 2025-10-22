@@ -1118,33 +1118,80 @@ class WebCrawler(SecureCookieMixin):
         p = self.page; assert p
         await self._wait_connections_ui_ready(timeout_ms)
 
-        # Try all candidates in priority order
-        for sel in self.CONNECTIONS_2ND_SELECTORS:
+        # Make sure nothing is hovering over the filter bar
+        await self._dismiss_open_popovers()
+
+        # Prefer the multiselect pill first (your DOM)
+        candidates_in_order = [
+            # New pills
+            "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']",
+            "ul.search-reusables__multiselect-pill-list button:has-text('2nd')",
+            # Old radios
+            "div[role='toolbar'] label:has-text('2nd')",
+            "div[role='toolbar'] div[role='radio']:has-text('2nd')",
+            "div[role='toolbar'] [aria-label*='2nd' i]",
+            # Generic
+            "button[aria-label='2nd']",
+            "button:has-text('2nd')",
+        ]
+
+        # Try clicking directly with waits for state flip
+        for sel in candidates_in_order:
             try:
                 target = p.locator(sel).first
                 if not await target.count():
                     continue
 
-                # Make it visible enough to click
+                # Bring the whole filters bar into view if possible
+                try:
+                    nav = await self._first_present("search_filters_nav")
+                    if nav:
+                        await nav.scroll_into_view_if_needed()
+                        await p.wait_for_timeout(120)
+                except Exception:
+                    pass
+
                 try: await target.scroll_into_view_if_needed()
                 except: pass
                 try: await target.wait_for(state="visible", timeout=1500)
                 except: pass
 
-                if not await self.click_with_retry(target, attempts=3, delay_ms=180):
-                    continue
+                if not await self.click_with_retry(target, attempts=3, delay_ms=160):
+                    # force click as a last try
+                    try:
+                        await p.evaluate("(el)=>el.click()", target)
+                    except Exception:
+                        pass
 
-                # Verify selection across BOTH variants:
-                ok = await self._verify_connections_2nd_selected()
-                if ok:
-                    return True
-                # Sometimes needs a beat for aria-* to flip
-                await p.wait_for_timeout(250)
+                # Wait for pill state (aria-pressed or selected class) to flip true
+                try:
+                    await p.wait_for_function(
+                        """
+                        (sel) => {
+                          const el = document.querySelector(sel);
+                          if (!el) return false;
+                          const pressed = (el.getAttribute('aria-pressed')||'').toLowerCase()==='true';
+                          const checked = (el.getAttribute('aria-checked')||'').toLowerCase()==='true';
+                          const cls = el.getAttribute('class') || '';
+                          const selected = cls.includes('search-reusables__multiselect-pill-button--selected');
+                          return pressed || checked || selected;
+                        }
+                        """,
+                        arg=sel,
+                        timeout=2500,
+                    )
+                except Exception:
+                    # fall back to shared verifier (covers radios and generic button cases)
+                    await p.wait_for_timeout(200)
+
                 if await self._verify_connections_2nd_selected():
                     return True
             except Exception:
                 continue
-        return False
+
+        # If direct click path failed, go via All Filters modal
+        return await self._set_2nd_via_all_filters()
+
 
 
     # --- legacy robust helpers kept (unchanged logic) ---
@@ -1515,27 +1562,102 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # New pill buttons variant
+        # New pill buttons variant — check aria-pressed OR a selected class
         try:
             btn = p.locator(
                 "ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], "
                 "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
             ).first
             if await btn.count():
-                v = (await btn.get_attribute("aria-pressed") or "").lower()
-                if v == "true":
+                pressed = (await btn.get_attribute("aria-pressed") or "").lower() == "true"
+                # class-based selection sometimes used by LI experiments
+                cls = (await btn.get_attribute("class") or "")
+                selected_cls = "search-reusables__multiselect-pill-button--selected" in cls
+                if pressed or selected_cls:
                     return True
         except Exception:
             pass
 
-        # Generic fallback
+        # Generic fallback — any 2nd-labeled button
         try:
             any_btn = p.locator("button[aria-label='2nd'], button:has-text('2nd')").first
             if await any_btn.count():
                 v1 = (await any_btn.get_attribute("aria-pressed") or "").lower()
                 v2 = (await any_btn.get_attribute("aria-checked") or "").lower()
-                return v1 == "true" or v2 == "true"
+                cls = (await any_btn.get_attribute("class") or "")
+                selected_cls = "search-reusables__multiselect-pill-button--selected" in cls
+                return v1 == "true" or v2 == "true" or selected_cls
         except Exception:
             pass
 
         return False
+
+
+    async def _set_2nd_via_all_filters(self) -> bool:
+        p = self.page; assert p
+        try:
+            dlg = await self._open_all_filters()
+
+            # Inside the modal, there’s usually a Connections group with 1st/2nd/3rd+ checkboxes or toggles
+            # Try a few variants for the "2nd" control
+            candidates = [
+                "input[type='checkbox'][value='S']",                      # LI sometimes uses S for 2nd network
+                "label:has-text('2nd') input[type='checkbox']",
+                "button[aria-label='2nd']",
+                "label:has-text('2nd')",
+            ]
+
+            target = None
+            for sel in candidates:
+                cand = dlg.locator(sel).first
+                if await cand.count():
+                    target = cand; break
+
+            if not target:
+                # fallback: find any control in dialog with visible text 2nd
+                target = dlg.locator(":is(button,label,input):has-text('2nd')").first
+                if not await target.count():
+                    await self._shot("all-filters-no-2nd")
+                    return False
+
+            try:
+                await target.scroll_into_view_if_needed()
+            except Exception:
+                pass
+            try:
+                await target.wait_for(state="visible", timeout=1500)
+            except Exception:
+                pass
+
+            # Click (force if needed)
+            try:
+                await target.click()
+            except Exception:
+                try:
+                    await p.evaluate("(el)=>el.click()", target)
+                except Exception:
+                    pass
+
+            # Apply / Show results
+            apply_btn = dlg.locator("button", has_text=re.compile(r"(show\s+results|apply)", re.I)).first
+            if await apply_btn.count():
+                await self.click_with_retry(apply_btn)
+            else:
+                # close dialog if no apply
+                esc_ok = True
+                try:
+                    await p.keyboard.press("Escape")
+                except Exception:
+                    esc_ok = False
+                if not esc_ok:
+                    # click backdrop
+                    try:
+                        await p.mouse.click(5, 5)
+                    except Exception:
+                        pass
+
+            await self.wait_network_quiet()
+            # Verify using the shared verifier (which looks at pills/radios)
+            return await self._verify_connections_2nd_selected()
+        except Exception:
+            return False
