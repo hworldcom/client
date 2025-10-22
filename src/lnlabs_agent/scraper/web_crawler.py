@@ -12,6 +12,7 @@ from platformdirs import user_log_dir, user_config_dir
 
 from lnlabs_agent.secure_cookies import SecureCookieMixin
 
+SECOND_RX = re.compile(r"^\s*2nd(?:\s*degree)?\b", re.I)
 
 def _ms(min_s: float = 0.15, max_s: float = 0.35) -> int:
     """Small human-like delay in ms."""
@@ -531,6 +532,7 @@ class WebCrawler(SecureCookieMixin):
         await self.page.wait_for_load_state("domcontentloaded")
 
         self.log("[step] filter 2nd-degree]")
+        await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
         try:
             await self._select_second_degree_toolbar_first()
         except Exception as e:
@@ -893,15 +895,32 @@ class WebCrawler(SecureCookieMixin):
         p = self.page; assert p
         self.log("[filters] selecting 2nd-degree")
 
-        sdui_label = p.locator("div[role='toolbar'] label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
-        if await sdui_label.count():
-            await self.click(sdui_label)
-            await self._shot("2nd-selected-sdui-label")
-            await self.wait_network_quiet()
-            return
-
+        # Prefer toolbar if present and hydrated (quick win even from modal path)
         try:
-            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
+            await self._wait_filters_toolbar_hydrated(timeout_ms=10_000)
+            tb = p.locator("div[role='toolbar']").first
+            if await tb.count():
+                radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
+                if await radio.count():
+                    await self.click(radio)
+                    await self._shot("2nd-selected-radio")
+                    await self.wait_network_quiet()
+                    return
+                sdui_label = tb.locator("label", has_text=SECOND_RX).first
+                if await sdui_label.count():
+                    await self.click(sdui_label)
+                    await self._shot("2nd-selected-sdui-label")
+                    await self.wait_network_quiet()
+                    return
+        except Exception:
+            # If toolbar not there, proceed with your other fallbacks
+            pass
+
+        # Original fallbacks with broadened matching:
+
+        # ARIA radio by name
+        try:
+            radio = p.get_by_role("radio", name=SECOND_RX).first
             await radio.wait_for(timeout=2000)
             await self.click(radio)
             await self._shot("2nd-selected-aria-radio")
@@ -910,6 +929,7 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        # Specific ARIA-label button
         try:
             btn = p.locator("button[aria-label='2nd']").first
             await btn.wait_for(timeout=2000)
@@ -920,8 +940,9 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        # Generic label with broader regex
         try:
-            lab = p.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
+            lab = p.locator("label", has_text=SECOND_RX).first
             await lab.wait_for(timeout=2000)
             await lab.click(force=True)
             await self._shot("2nd-selected-generic-label")
@@ -943,68 +964,109 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-    async def _select_second_degree_toolbar_first(self) -> None:
-        p = self.page; assert p
-        self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
+async def _select_second_degree_toolbar_first(self) -> None:
+    p = self.page; assert p
+    self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
 
-        try:
-            await self.wait_for_any(
-                [
-                    "nav[aria-label='Search filters']",
-                    "div[role='toolbar']",
-                ],
-                timeout=7000,
-            )
-        except Exception:
-            self.log("[filters] no toolbar/nav attached yet")
-            await self._open_connections_filter()
-            return
+    # Keep your original wait targets but extend the timeout a bit
+    try:
+        await self.wait_for_any(
+            [
+                "nav[aria-label='Search filters']",
+                "div[role='toolbar']",
+            ],
+            timeout=15_000,
+        )
+    except Exception:
+        self.log("[filters] no toolbar/nav attached yet")
+        await self._open_connections_filter()
+        return
 
-        try:
-            tb = p.locator("div[role='toolbar']").first
-            if await tb.count():
-                await tb.scroll_into_view_if_needed()
-                await p.wait_for_timeout(120)
-        except Exception:
-            pass
+    # Make sure the lazy filter bar is actually hydrated
+    await self._wait_filters_toolbar_hydrated(timeout_ms=15_000)
 
-        sdui_label = p.locator("div[role='toolbar'] label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
-        if await sdui_label.count():
-            await self.click(sdui_label)
-            await self._shot("2nd-selected-sdui-label")
-            await self.wait_network_quiet()
-            return
+    # Try working primarily inside the toolbar scope
+    tb = p.locator("div[role='toolbar']").first
+    try:
+        if await tb.count():
+            await tb.scroll_into_view_if_needed()
+            await p.wait_for_timeout(120)
+    except Exception:
+        pass
 
-        try:
-            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
-            if await radio.count():
-                await self.click(radio)
-                await self._shot("2nd-selected-aria-radio")
+    # 1) Preferred: click the radio container that has a label with "2nd"
+    radio = tb.locator("div[role='radio']:has(label:has-text('2nd'))").first
+    if await radio.count():
+        await self.click(radio)
+        await self._shot("2nd-selected-radio")
+        await self.wait_network_quiet()
+        return
+
+    # 2) Label inside toolbar (your original approach but regex loosened)
+    sdui_label = tb.locator("label", has_text=SECOND_RX).first
+    if await sdui_label.count():
+        await self.click(sdui_label)
+        await self._shot("2nd-selected-sdui-label")
+        await self.wait_network_quiet()
+        return
+
+    # 3) ARIA radio by accessible name (still scoped first, then global)
+    radio_scoped = tb.get_by_role("radio", name=SECOND_RX).first
+    if await radio_scoped.count():
+        await self.click(radio_scoped)
+        await self._shot("2nd-selected-aria-radio-scoped")
+        await self.wait_network_quiet()
+        return
+
+    radio_global = p.get_by_role("radio", name=SECOND_RX).first
+    if await radio_global.count():
+        await self.click(radio_global)
+        await self._shot("2nd-selected-aria-radio-global")
+        await self.wait_network_quiet()
+        return
+
+    # 4) Try the multiselect chips inside the nav (kept from your code)
+    try:
+        nav = self._filters_nav()
+        if await nav.count():
+            btn = nav.locator(
+                "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
+            ).first
+            if not await btn.count():
+                btn = nav.locator(
+                    "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+                ).first
+            if await btn.count():
+                await self.click(btn)
+                await self._shot("2nd-selected-multiselect")
                 await self.wait_network_quiet()
                 return
-        except Exception:
-            pass
+    except Exception:
+        pass
 
-        try:
-            nav = self._filters_nav()
-            if await nav.count():
-                btn = nav.locator(
-                    "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
-                ).first
-                if not await btn.count():
-                    btn = nav.locator(
-                        "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
-                    ).first
-                if await btn.count():
-                    await self.click(btn)
-                    await self._shot("2nd-selected-multiselect")
-                    await self.wait_network_quiet()
-                    return
-        except Exception:
-            pass
+    # 5) Generic label/button fallbacks (kept, regex broadened)
+    try:
+        btn = p.locator("button[aria-label='2nd']").first
+        if await btn.count():
+            await self.click(btn)
+            await self._shot("2nd-selected-button")
+            await self.wait_network_quiet()
+            return
+    except Exception:
+        pass
 
-        self.log("[filters] toolbar chips not clickable → using All filters modal")
-        await self._open_connections_filter()
+    try:
+        lab = p.locator("label", has_text=SECOND_RX).first
+        if await lab.count():
+            await lab.click(force=True)
+            await self._shot("2nd-selected-generic-label")
+            await self.wait_network_quiet()
+            return
+    except Exception:
+        pass
+
+    self.log("[filters] toolbar chips not clickable → using All filters modal")
+    await self._open_connections_filter()
 
     async def locate_within_scroll(self, text, MAX_SCROLLS=5, DELAY=1):
         for i in range(MAX_SCROLLS):
@@ -1155,3 +1217,26 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 return None
         return None
+
+    async def _wait_filters_toolbar_hydrated(self, timeout_ms: int = 15_000) -> None:
+        """Wait until the lazyLoadedFilterBar renders a visible toolbar with radios."""
+        p = self.page; assert p
+        # Wait for the SDUI container, then for the toolbar and at least one radio
+        await p.wait_for_selector(
+            "[data-sdui-component*='lazyLoadedFilterBar']",
+            timeout=timeout_ms
+        )
+        # The toolbar itself
+        await p.wait_for_selector(
+            "div[role='toolbar']",
+            timeout=timeout_ms
+        )
+        # Radios inside the toolbar; we don't assume which labels are present
+        try:
+            await p.wait_for_selector(
+                "div[role='toolbar'] div[role='radio']",
+                timeout=timeout_ms
+            )
+        except Exception:
+            # Some variants render as buttons/labels first; just let the caller proceed.
+            pass
