@@ -205,6 +205,23 @@ class WebCrawler(SecureCookieMixin):
 
         # Expose the result-card list for quick patching (legacy external entry point)
         self.RESULT_CARD_SELECTORS = list(SELECTORS["result_cards"])
+        self.CONNECTIONS_CONTAINER_SELECTORS = [
+            "div[role='toolbar']",                              # old/radio toolbar
+            "ul.search-reusables__multiselect-pill-list",       # new/pill list
+        ]
+
+        self.CONNECTIONS_2ND_SELECTORS = [
+            # Old toolbar/radio style
+            "div[role='toolbar'] label:has-text('2nd')",
+            "div[role='toolbar'] div[role='radio']:has-text('2nd')",
+            "div[role='toolbar'] [aria-label*='2nd' i]",
+            # New multiselect buttons
+            "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']",
+            "ul.search-reusables__multiselect-pill-list button:has-text('2nd')",
+            # Generic fallbacks
+            "button[aria-label='2nd']",
+            "button:has-text('2nd')",
+        ]
 
     # ------------------------ Paths / shots ------------------------
 
@@ -746,7 +763,6 @@ class WebCrawler(SecureCookieMixin):
         await self._open_company_employees()
 
         self.log("[step] filter 2nd-degree (simple toolbar click)]")
-        await self.page.wait_for_timeout(20000)
         ok = await self._click_second_degree_simple(timeout_ms=15_000)
         if not ok:
             await self._shot("2nd-simple-failed")
@@ -1068,24 +1084,14 @@ class WebCrawler(SecureCookieMixin):
         return dlg
 
     # --- simplified “2nd” selection path (no All Filters, no scrolling) ---
-    async def _wait_toolbar_ready(self, timeout_ms: int = 10_000):
-        """Wait until the SDUI toolbar is attached and has its radio items."""
+    async def _wait_connections_ui_ready(self, timeout_ms: int = 10_000):
         p = self.page; assert p
-        tb = p.locator(_join(SELECTORS["toolbar"])).first
-        await tb.wait_for(state="visible", timeout=timeout_ms)
-
-        # Wait until at least one radio exists and a label is present
+        sels = self.CONNECTIONS_CONTAINER_SELECTORS
         await p.wait_for_function(
-            """() => {
-                const tb = document.querySelector('div[role="toolbar"]');
-                if (!tb) return false;
-                const radios = tb.querySelectorAll('div[role="radio"]');
-                const lbls   = tb.querySelectorAll('label');
-                return radios.length >= 1 && lbls.length >= 1;
-            }""",
-            timeout=timeout_ms,
+            """(sels)=>sels.some(s=>document.querySelector(s))""",
+            arg=sels, timeout=timeout_ms
         )
-        return tb
+
 
     async def _verify_2nd_checked(self) -> bool:
         p = self.page; assert p
@@ -1108,59 +1114,37 @@ class WebCrawler(SecureCookieMixin):
         return False
 
     async def _click_second_degree_simple(self, timeout_ms: int = 12_000) -> bool:
-        """
-        Minimal path: wait toolbar → click the <label>2nd</label> (or radio) → verify aria-checked.
-        """
         p = self.page; assert p
-        tb = await self._wait_toolbar_ready(timeout_ms=timeout_ms)
+        await self._wait_connections_ui_ready(timeout_ms)
 
-        candidates = [
-            tb.locator("label").filter(has_text=SECOND_RX).first,                 # <label for="...">2nd</label>
-            tb.get_by_role("radio", name=SECOND_RX).first,                        # ARIA radio by name
-            tb.locator('div[role="radio"]').filter(has_text=SECOND_RX).first,     # radio container
-        ]
-
-        target = None
-        for c in candidates:
+        # Try all candidates in priority order
+        for sel in self.CONNECTIONS_2ND_SELECTORS:
             try:
-                if c and await c.count():
-                    target = c
-                    break
+                target = p.locator(sel).first
+                if not await target.count():
+                    continue
+
+                # Make it visible enough to click
+                try: await target.scroll_into_view_if_needed()
+                except: pass
+                try: await target.wait_for(state="visible", timeout=1500)
+                except: pass
+
+                if not await self.click_with_retry(target, attempts=3, delay_ms=180):
+                    continue
+
+                # Verify selection across BOTH variants:
+                ok = await self._verify_connections_2nd_selected()
+                if ok:
+                    return True
+                # Sometimes needs a beat for aria-* to flip
+                await p.wait_for_timeout(250)
+                if await self._verify_connections_2nd_selected():
+                    return True
             except Exception:
                 continue
+        return False
 
-        if not target:
-            await self._shot("2nd-target-not-found-simple")
-            return False
-
-        try:
-            await target.scroll_into_view_if_needed()
-        except Exception:
-            pass
-        try:
-            await target.wait_for(state="visible", timeout=2000)
-        except Exception:
-            pass  # sometimes label is offscreen but still clickable
-
-        if not await self.click_with_retry(target, attempts=3, delay_ms=180):
-            self.audit("[2nd] click_with_retry failed")
-            return False
-
-        # Verify activation
-        try:
-            await p.wait_for_function(
-                """() => {
-                    const tb = document.querySelector('div[role="toolbar"]');
-                    if (!tb) return false;
-                    const r = [...tb.querySelectorAll('div[role="radio"]')]
-                        .find(x => /(^|\\s)2nd(\\s|$)/i.test((x.textContent||'')));
-                    return r && r.getAttribute('aria-checked') === 'true';
-                }""",
-                timeout=4_000,
-            )
-            return True
-        except Exception:
-            return await self._verify_2nd_checked()
 
     # --- legacy robust helpers kept (unchanged logic) ---
     async def _wait_filters_toolbar_hydrated(self, timeout_ms: int = 15_000) -> None:
@@ -1515,3 +1499,42 @@ class WebCrawler(SecureCookieMixin):
 
         await self._shot("employees-link-missing")
         raise TimeoutError(f"Employees link not found on company page: {last_err}")
+
+
+    async def _verify_connections_2nd_selected(self) -> bool:
+        p = self.page; assert p
+
+        # Old toolbar/radio variant
+        try:
+            radio = p.locator('div[role="toolbar"] div[role="radio"]').filter(has_text=SECOND_RX).first
+            if await radio.count():
+                v = (await radio.get_attribute("aria-checked") or "").lower()
+                if v == "true":
+                    return True
+        except Exception:
+            pass
+
+        # New pill buttons variant
+        try:
+            btn = p.locator(
+                "ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], "
+                "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+            ).first
+            if await btn.count():
+                v = (await btn.get_attribute("aria-pressed") or "").lower()
+                if v == "true":
+                    return True
+        except Exception:
+            pass
+
+        # Generic fallback
+        try:
+            any_btn = p.locator("button[aria-label='2nd'], button:has-text('2nd')").first
+            if await any_btn.count():
+                v1 = (await any_btn.get_attribute("aria-pressed") or "").lower()
+                v2 = (await any_btn.get_attribute("aria-checked") or "").lower()
+                return v1 == "true" or v2 == "true"
+        except Exception:
+            pass
+
+        return False
