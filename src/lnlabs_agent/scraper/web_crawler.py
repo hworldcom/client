@@ -1661,3 +1661,19 @@ class WebCrawler(SecureCookieMixin):
             return await self._verify_connections_2nd_selected()
         except Exception:
             return False
+
+
+    async def _dismiss_open_popovers(self):
+        p = self.page; assert p
+        try:
+            # hit Escape a couple of times
+            await p.keyboard.press("Escape")
+            await p.wait_for_timeout(100)
+            await p.keyboard.press("Escape")
+        except Exception:
+            pass
+        # try clicking outside the filters bar
+        try:
+            await p.mouse.click(5, 5)
+        except Exception:
+            pass
