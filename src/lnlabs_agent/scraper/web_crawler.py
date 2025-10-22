@@ -1,10 +1,10 @@
 # src/lnlabs_agent/scraper/web_crawler.py
 from __future__ import annotations
 
-import os, json, re, random, asyncio
+import os, re, json, random, asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Iterable
 from datetime import datetime
 
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -12,12 +12,118 @@ from platformdirs import user_log_dir, user_config_dir
 
 from lnlabs_agent.secure_cookies import SecureCookieMixin
 
+# ------------------------ Regexes / small utils ------------------------
+
 SECOND_RX = re.compile(r"^\s*2nd(?:\s*degree)?\b", re.I)
 
 def _ms(min_s: float = 0.15, max_s: float = 0.35) -> int:
     """Small human-like delay in ms."""
     return int(random.uniform(min_s, max_s) * 1000)
 
+# ------------------------ Centralized selector registry ------------------------
+# For each "object" we target on linkedin, we keep a list of alternative selectors.
+# Add to these lists (don't replace) when LinkedIn changes markup.
+
+SELECTORS = {
+    # --- Global / layout ---
+    "results_container": [
+        "div.search-results-container",                         # classic
+        "div.search-results__list",                             # alt (some A/B)
+    ],
+    "result_cards": [
+        '[data-view-name="people-search-result"]',
+        '[data-view-name="search-result"]',
+        '[data-view-name="search-entity-result-universal-template"]',
+        '[data-view-name^="search-entity-result-"]',
+        '[data-chameleon-result-urn]',
+        "li.reusable-search__result-container",
+        "div.search-result__wrapper",
+    ],
+    "profile_link_in_card": [
+        'a[href*="/in/"]'
+    ],
+    "company_link_anywhere": [
+        "a[href*='/company/']"
+    ],
+    "search_filters_nav": [
+        "nav[aria-label='Search filters']",
+        "#search-reusables__filters-bar nav[aria-label='Search filters']",  # nested
+    ],
+    "toolbar": [
+        "div[role='toolbar']",
+    ],
+    "all_filters_button": [
+        "button.search-reusables__all-filters-pill-button",
+        "button[aria-label='All filters']",
+        "button[aria-label='All Filters']",
+        "button[aria-label*='All' i][aria-label*='filter' i]",
+        "button.artdeco-pill:has-text('All filters')",
+    ],
+    "companies_pill": [
+        "ul.search-reusables__filter-list li button:has-text('Companies')",
+        "button.artdeco-pill:has-text('Companies')",
+        "button:has-text('Companies')",
+    ],
+    "connections_pill": [
+        # Prefer role-based first; fallbacks allow text match
+        "button[role='button']:has-text('Connections')",
+        "[data-test-reusables-filters__filter-pill='CONNECTIONS']",
+        "button:has-text('All filters')",  # as a last resort open All filters
+    ],
+    # --- Search input / header ---
+    "search_input": [
+        "#global-nav-search input.search-global-typeahead__input",
+        "header#global-nav input.search-global-typeahead__input",
+        "header#global-nav input[role='combobox'][aria-autocomplete='list']",
+        "input[data-view-name='search-global-typeahead-input']",
+        "div[role='search'] input[data-testid='typeahead-input']",
+        "input[data-testid='typeahead-input']",
+        "div[role='search'] input[aria-autocomplete='list']",
+        "input[placeholder='Search']",
+        "input[aria-label='Search']",
+    ],
+    "search_expand_button": [
+        "button.search-global-typeahead__collapsed-search-button",
+    ],
+    # --- Company page ---
+    "company_employees_link": [
+        "div.org-top-card-summary-info-list div.inline-block >> a:has(span:has-text('employees'))",
+        "a:has(span:has-text('employees'))",
+        "a[href*='/people/']",
+    ],
+    # --- Pagination ---
+    "pagination_container": [
+        "div.artdeco-pagination",
+        "nav[aria-label='Pagination']",
+        "ul.artdeco-pagination__pages",
+    ],
+    "pagination_next_button": [
+        "button[data-testid='pagination-controls-next-button-visible']",
+        "button.artdeco-pagination__button--next",
+        "nav[aria-label='Pagination'] button[aria-label='Next']",
+        "button[aria-label='Next']",
+        "button:has-text('Next')",
+    ],
+    "pagination_next_hidden": [
+        "button[data-testid='pagination-controls-next-button-hidden']",
+    ],
+    "pagination_page_label": [
+        'button[aria-current="true"][aria-label^="Page"] span',
+        "li.active button[aria-label^='Page'] span",
+        "li.selected button[aria-label^='Page'] span",
+    ],
+    "pagination_active_li": [
+        "div.artdeco-pagination ul.artdeco-pagination__pages li.active",
+        "ul.artdeco-pagination__pages li.active",
+        "li.artdeco-pagination__indicator.active",
+        "li.artdeco-pagination__indicator.selected",
+    ],
+}
+
+def _join(selectors: Iterable[str]) -> str:
+    return ", ".join(selectors)
+
+# ------------------------ Crawler ------------------------
 
 class WebCrawler(SecureCookieMixin):
     def __init__(
@@ -81,22 +187,14 @@ class WebCrawler(SecureCookieMixin):
         self.context = None
         self.page = None
 
-        # --- results selectors (support multiple UI variants) ---
-        self.RESULT_CARD_SELECTORS = [
-            '[data-view-name="people-search-result"]',
-            '[data-view-name="search-result"]',
-            '[data-view-name="search-entity-result-universal-template"]',
-            '[data-view-name^="search-entity-result-"]',
-            '[data-chameleon-result-urn]',
-            # extra catches
-            "li.reusable-search__result-container",
-            "div.search-result__wrapper",
-        ]
+        # Expose the result-card list for quick patching (legacy external entry point)
+        self.RESULT_CARD_SELECTORS = list(SELECTORS["result_cards"])
+
+    # ------------------------ Paths / shots ------------------------
 
     def _abs(self, p: os.PathLike | str) -> Path:
         return Path(p).expanduser().resolve()
 
-    # ---------- screenshots ----------
     async def _shot(self, name: str) -> None:
         try:
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -107,7 +205,8 @@ class WebCrawler(SecureCookieMixin):
         except Exception as e:
             self.log(f"[shot] failed: {e}")
 
-    # ---------- public session helpers ----------
+    # ------------------------ Session helpers ------------------------
+
     @asynccontextmanager
     async def session(self, headless: bool = False):
         """Use as: `async with crawler.session(): ...`"""
@@ -124,7 +223,8 @@ class WebCrawler(SecureCookieMixin):
     async def __aexit__(self, exc_type, exc, tb):
         await self._teardown_context()
 
-    # ---------- audit (file-only) ----------
+    # ------------------------ Auditing ------------------------
+
     def _audit_write(self, line: str) -> None:
         if not line:
             return
@@ -152,7 +252,8 @@ class WebCrawler(SecureCookieMixin):
         if self.verbose_network:
             self._audit_write(line)
 
-    # ---------- attach page listeners ----------
+    # ------------------------ Page listeners ------------------------
+
     def _attach_page_logging(self) -> None:
         assert self.page
 
@@ -199,7 +300,8 @@ class WebCrawler(SecureCookieMixin):
         self.page.on("console", _on_console)
         self.log("[session] browser ready (handlers attached)")
 
-    # ---------- playwright context ----------
+    # ------------------------ Playwright context ------------------------
+
     async def _prepare_context(self, headless: bool):
         self.log(f"[paths] cookies file: {self._abs(self.COOKIE_FILE)}")
         self.log(f"[paths] artifacts dir: {self._abs(self.artifacts_dir)}")
@@ -271,9 +373,47 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 pass
             self.page = self.context = self.browser = self.playwright = None
-            self.log("[session] closed")
+            self.log("[session] closed]")
 
-    # -------- small helpers --------
+    # ------------------------ Tiny loc utilities (selector-aware) ------------------------
+
+    def _sel(self, key: str) -> List[str]:
+        return SELECTORS.get(key, [])
+
+    def _loc(self, key: str):
+        """Return a Locator for 'any of' the selectors under key (union)."""
+        assert self.page
+        sels = self._sel(key)
+        if not sels:
+            return self.page.locator("__never__")
+        return self.page.locator(_join(sels))
+
+    async def _first_present(self, key: str):
+        """Return the first locator under key that exists (count>0), else None."""
+        assert self.page
+        for sel in self._sel(key):
+            loc = self.page.locator(sel).first
+            try:
+                if await loc.count():
+                    return loc
+            except Exception:
+                continue
+        return None
+
+    async def _first_visible(self, key: str, timeout_ms: int = 2000):
+        """Return the first locator under key that becomes visible (best-effort)."""
+        assert self.page
+        for sel in self._sel(key):
+            loc = self.page.locator(sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=timeout_ms)
+                return loc
+            except Exception:
+                continue
+        return None
+
+    # ------------------------ Basic helpers ------------------------
+
     async def wait_visible(self, locator, timeout: int = 10_000):
         await locator.wait_for(state="visible", timeout=timeout)
         return locator
@@ -302,7 +442,6 @@ class WebCrawler(SecureCookieMixin):
                 return True
             except Exception:
                 await self.page.wait_for_timeout(200 + i * 120)
-        # Fallback: select-all + backspace
         try:
             await self.page.keyboard.press("Meta+A")
             await self.page.keyboard.press("Backspace")
@@ -317,7 +456,8 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             await self.page.wait_for_timeout(600)
 
-    # -------- auth helpers --------
+    # ------------------------ Auth helpers ------------------------
+
     async def login_if_needed(self, wait_ms: int = 30_000) -> bool:
         assert self.page
         self.log("[auth] checking login")
@@ -362,7 +502,8 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             return False
 
-    # -------- navigation primitives --------
+    # ------------------------ Navigation primitives ------------------------
+
     async def safe_goto(self, url: str, max_retries: int = 3) -> bool:
         assert self.page
         for attempt in range(max_retries):
@@ -393,7 +534,8 @@ class WebCrawler(SecureCookieMixin):
                 continue
         raise TimeoutError(f"None of selectors appeared: {selectors}")
 
-    # -------- basic helpers --------
+    # ------------------------ Basic locator wrappers ------------------------
+
     async def locate(self, sel: str, timeout: int = 10_000):
         assert self.page
         loc = self.page.locator(sel).first
@@ -430,12 +572,13 @@ class WebCrawler(SecureCookieMixin):
         assert self.page
         await self.page.keyboard.press("Enter")
 
-    # ---------- results helpers ----------
+    # ------------------------ Results helpers ------------------------
+
     async def _wait_for_results(self, timeout_ms: int = 20_000) -> None:
         p = self.page; assert p
 
         # Fast path: any visible selector quickly
-        for sel in self.RESULT_CARD_SELECTORS:
+        for sel in SELECTORS["result_cards"]:
             try:
                 await p.wait_for_selector(f"{sel} >> visible=true", timeout=3_000)
                 return
@@ -445,16 +588,77 @@ class WebCrawler(SecureCookieMixin):
         # Slow path: any matching element in the DOM
         await p.wait_for_function(
             """(sels) => sels.some(s => document.querySelector(s))""",
-            arg=self.RESULT_CARD_SELECTORS,
+            arg=SELECTORS["result_cards"],
             timeout=timeout_ms,
         )
         await p.wait_for_timeout(400)
 
     def _result_cards(self):
-        # NOTE: kept sync to preserve signature; don't do async counts here.
+        # kept sync (legacy callsites)
         return self._result_cards_union()
 
-    # -------- main flows --------
+    def _result_cards_union(self):
+        """
+        Broad union of result-card selectors, filtered to only cards that contain a profile link (/in/).
+        This keeps us layout-agnostic and avoids ads / widgets.
+        """
+        p = self.page; assert p
+        union = _join(SELECTORS["result_cards"])
+        cards = p.locator(union)
+        return cards.filter(has=p.locator(_join(SELECTORS["profile_link_in_card"])))
+
+    async def _maybe_scoped_cards(self):
+        """
+        Prefer scoping to the container if (and only if) it exists *and* contains results.
+        Fallback to the page-wide union otherwise.
+        """
+        p = self.page; assert p
+        base = self._result_cards_union()
+        container = await self._first_present("results_container")
+        try:
+            if container:
+                scoped = container.locator(_join(SELECTORS["result_cards"]))
+                scoped = scoped.filter(has=p.locator(_join(SELECTORS["profile_link_in_card"])))
+                if await scoped.count() > 0:
+                    return scoped
+        except Exception:
+            pass
+        return base
+
+    async def _card_name_and_url(self, card):
+        """
+        Extract just {name, url} from a result card.
+        - URL: first profile link
+        - Name: prefer lockup title, then the anchor text
+        - Normalize URL: absolute + strip ?query#fragment
+        """
+        # URL
+        link = card.locator(_join(SELECTORS["profile_link_in_card"])).first
+        href = await link.get_attribute("href") if await link.count() else None
+        url = (href or "").strip() or None
+        if url:
+            if url.startswith("/"):  # absolutize if needed
+                base = self.URL.rstrip("/")
+                url = f"{base}{url}"
+            url = url.split("?", 1)[0].split("#", 1)[0]  # strip query/fragment
+
+        # NAME (prefer lockup title; fallback to anchor text)
+        name_loc = card.locator(
+            '[data-view-name="search-result-lockup-title"] a, '
+            'a[data-view-name="search-result-lockup-title"], '
+            + _join(SELECTORS["profile_link_in_card"])
+        ).first
+        name_txt = ""
+        try:
+            name_txt = (await name_loc.text_content() or "").strip()
+        except Exception:
+            pass
+        name = name_txt or "(unknown)"
+
+        return {"name": name, "url": url}
+
+    # ------------------------ Main flows ------------------------
+
     async def start_company_flow(self, company: str):
         self.log(f"[flow] company={company}")
         await self._shot("before-search")
@@ -491,7 +695,8 @@ class WebCrawler(SecureCookieMixin):
         await self._shot("companies-tab")
 
         self.log("[step] wait results container")
-        await self.wait_to_appear("div.search-results-container")
+        container_union = self._loc("results_container")
+        await container_union.first.wait_for(timeout=10_000)
         await self._wait_for_results()
         await self._shot("results-container")
 
@@ -505,7 +710,7 @@ class WebCrawler(SecureCookieMixin):
         a_tag = None
         for item in all_items:
             try:
-                cand = item.locator("a[href*='/company/']").first
+                cand = item.locator(_join(SELECTORS["company_link_anywhere"])).first
                 href = await cand.get_attribute("href")
                 if href and "/company/" in href:
                     a_tag = cand
@@ -522,9 +727,10 @@ class WebCrawler(SecureCookieMixin):
         await self._shot("company-opened")
 
         self.log("[step] open employees")
-        employee_button = await self.locate(
-            "div.org-top-card-summary-info-list div.inline-block >> a:has(span:has-text('employees'))"
-        )
+        employee_button = await self._first_present("company_employees_link")
+        if not employee_button:
+            await self._shot("employees-link-missing")
+            raise TimeoutError("Employees link not found on company page")
         await self._shot("employees-link")
         await self.click(employee_button)
         await self.page.wait_for_load_state("domcontentloaded")
@@ -540,18 +746,16 @@ class WebCrawler(SecureCookieMixin):
         await self._extract_data_names_urls(out_names, out_urls)
         self.log(f"[step] extracted {len(out_urls)} urls")
 
+    # ------------------------ Search filters / pills ------------------------
+
     async def _click_companies_tab(self) -> None:
         p = self.page
         assert p
-        self.log("[companies] click 'Companies' pill (resilient)")
+        self.log("[companies] click 'Companies' pill (via registry)")
 
         try:
             await self.wait_for_any(
-                [
-                    "nav[aria-label='Search filters']",
-                    "#search-reusables__filters-bar",
-                    "ul.search-reusables__filter-list",
-                ],
+                self._sel("search_filters_nav") + ["#search-reusables__filters-bar", "ul.search-reusables__filter-list"],
                 timeout=12_000,
             )
         except Exception:
@@ -559,31 +763,29 @@ class WebCrawler(SecureCookieMixin):
             await self._shot("companies-toolbar-not-found")
             raise
 
-        nav = p.locator("nav[aria-label='Search filters']").first
-        in_nav = None
-        try:
-            if await nav.count():
-                in_nav = nav.locator("ul.search-reusables__filter-list li button") \
-                    .filter(has_text=re.compile(r"^\s*Companies\s*$", re.I)).first
-        except Exception:
-            pass
-
-        candidates = [
-            in_nav,
-            p.locator("#search-reusables__filters-bar ul.search-reusables__filter-list li button")
-             .filter(has_text=re.compile(r"^\s*Companies\s*$", re.I)).first,
-            p.get_by_role("button", name=re.compile(r"^\s*Companies\s*$", re.I)).first,
-            p.locator("button.artdeco-pill", has_text=re.compile(r"^\s*Companies\s*$", re.I)).first,
-        ]
+        # Try within nav first
+        nav = await self._first_present("search_filters_nav")
 
         btn = None
-        for cand in candidates:
-            try:
-                if cand and await cand.count():
-                    btn = cand
-                    break
-            except Exception:
-                continue
+        if nav:
+            # All variants inside nav
+            for sel in self._sel("companies_pill"):
+                cand = nav.locator(sel).first
+                try:
+                    if await cand.count():
+                        btn = cand; break
+                except Exception:
+                    continue
+
+        if not btn:
+            # Global fallbacks
+            for sel in self._sel("companies_pill"):
+                cand = p.locator(sel).first
+                try:
+                    if await cand.count():
+                        btn = cand; break
+                except Exception:
+                    continue
 
         if not btn:
             await self._shot("companies-button-not-found")
@@ -614,7 +816,7 @@ class WebCrawler(SecureCookieMixin):
             pass
 
         try:
-            await p.wait_for_selector("a[href*='/company/']", timeout=6_000)
+            await p.wait_for_selector(_join(SELECTORS["company_link_anywhere"]), timeout=6_000)
         except Exception:
             await self._shot("companies-after-click-no-company-links-yet")
 
@@ -629,10 +831,14 @@ class WebCrawler(SecureCookieMixin):
         if not ok:
             await self.safe_goto(self.URL + "feed/", max_retries=2)
 
-        await p.wait_for_selector(
-            "header#global-nav, div[role='search'] input[data-testid='typeahead-input']",
-            timeout=10_000
-        )
+        # either global nav exists or search input appears
+        try:
+            await p.wait_for_selector(
+                "header#global-nav, " + _join(SELECTORS["search_input"]),
+                timeout=10_000
+            )
+        except Exception:
+            pass
 
         try:
             await self._ensure_search_box_open()
@@ -643,7 +849,7 @@ class WebCrawler(SecureCookieMixin):
         p = self.page; assert p
 
         try:
-            await p.wait_for_selector("div.artdeco-pagination, ul.artdeco-pagination__pages", timeout=4_000)
+            await p.wait_for_selector(_join(SELECTORS["pagination_container"]), timeout=4_000)
         except Exception:
             pass
 
@@ -699,9 +905,10 @@ class WebCrawler(SecureCookieMixin):
 
     async def _ensure_search_box_open(self) -> None:
         p = self.page; assert p
+        # If there's a collapsed button and the input isn't visible, click it.
         try:
-            btn = p.locator("button.search-global-typeahead__collapsed-search-button").first
-            if await btn.count() and not await p.locator("#global-nav-search input").first.is_visible():
+            btn = await self._first_present("search_expand_button")
+            if btn and not await p.locator("#global-nav-search input").first.is_visible():
                 await btn.click()
                 await p.wait_for_timeout(200)
                 return
@@ -711,22 +918,10 @@ class WebCrawler(SecureCookieMixin):
     async def _find_global_search_input(self):
         p = self.page; assert p
 
-        candidates = [
-            "#global-nav-search input.search-global-typeahead__input",
-            "header#global-nav input.search-global-typeahead__input",
-            "header#global-nav input[role='combobox'][aria-autocomplete='list']",
-            "input[data-view-name='search-global-typeahead-input']",
-            "div[role='search'] input[data-testid='typeahead-input']",
-            "input[data-testid='typeahead-input']",
-            "div[role='search'] input[aria-autocomplete='list']",
-            "input[placeholder='Search']",
-            "input[aria-label='Search']",
-        ]
-
         await self._ensure_search_box_open()
 
         # Prefer an interactable input
-        for sel in candidates:
+        for sel in self._sel("search_input"):
             loc = p.locator(sel).first
             try:
                 if await loc.count():
@@ -743,7 +938,7 @@ class WebCrawler(SecureCookieMixin):
         try:
             await p.keyboard.press("/")
             await p.wait_for_timeout(150)
-            for sel in candidates:
+            for sel in self._sel("search_input"):
                 loc = p.locator(sel).first
                 if await loc.count() and await loc.is_enabled():
                     return loc
@@ -752,51 +947,42 @@ class WebCrawler(SecureCookieMixin):
 
         raise TimeoutError("Could not find a visible global search input in either header variant.")
 
-    # ---------- filters helpers (new) ----------
+    # ------------------------ Filters helpers ------------------------
+
     def _filters_nav(self):
-        return self.page.locator("nav[aria-label='Search filters']").first
+        # Favor first present nav
+        return self._loc("search_filters_nav")
 
     async def _open_connections_filter(self) -> None:
         p = self.page; assert p
         self.log("[filters] open 'Connections' filter")
 
-        nav = self._filters_nav()
-        if await nav.count():
-            try:
-                btn = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I)).first
-                await btn.wait_for(timeout=2000)
-                await self.click(btn)
-                await self._shot("connections-pill-open")
-                return
-            except Exception:
-                pass
+        nav = await self._first_present("search_filters_nav")
+        if nav:
+            # 1) Try connections pill in the nav
+            for sel in self._sel("connections_pill"):
+                try:
+                    btn = nav.locator(sel).first
+                    if await btn.count():
+                        await btn.wait_for(timeout=1500)
+                        await self.click(btn)
+                        await self._shot("connections-pill-open")
+                        return
+                except Exception:
+                    continue
 
-            try:
-                pill = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
-                await pill.wait_for(timeout=1500)
-                await self.click(pill)
-                await self._shot("connections-pill-dataattr")
-                return
-            except Exception:
-                pass
-
-            try:
-                allf = nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
-                await allf.wait_for(timeout=2000)
-                await self.click(allf)
-                await self._shot("all-filters-open")
-                return
-            except Exception:
-                pass
-
+        # 2) Try toolbar-level "All filters" as fallback
         try:
-            tb = p.locator("div[role='toolbar']").first
-            if await tb.count():
-                allf_tb = tb.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
-                if await allf_tb.count():
-                    await self.click(allf_tb)
-                    await self._shot("all-filters-open-toolbar")
-                    return
+            tb = await self._first_present("toolbar")
+            if tb:
+                # Try "All filters" in toolbar
+                for sel in self._sel("all_filters_button"):
+                    allf_tb = tb.locator(sel).first
+                    if await allf_tb.count():
+                        await self.click(allf_tb)
+                        await self._shot("all-filters-open-toolbar")
+                        return
+                # Generic text fallback
                 allf_any = tb.locator("button", has_text=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
                 if await allf_any.count():
                     await self.click(allf_any)
@@ -805,14 +991,16 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        try:
-            allf_global = p.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
-            if await allf_global.count():
-                await self.click(allf_global)
-                await self._shot("all-filters-open-global")
-                return
-        except Exception:
-            pass
+        # 3) Try global "All filters"
+        for sel in self._sel("all_filters_button"):
+            try:
+                allf_global = p.locator(sel).first
+                if await allf_global.count():
+                    await self.click(allf_global)
+                    await self._shot("all-filters-open-global")
+                    return
+            except Exception:
+                continue
 
         await self._shot("connections-open-failed")
         raise TimeoutError("Could not open Connections / All filters UI")
@@ -820,27 +1008,26 @@ class WebCrawler(SecureCookieMixin):
     async def _open_all_filters(self):
         p = self.page; assert p
 
-        nav = self._filters_nav()
+        nav = await self._first_present("search_filters_nav")
         try:
-            await nav.scroll_into_view_if_needed()
+            if nav:
+                await nav.scroll_into_view_if_needed()
         except Exception:
             pass
 
-        candidates = [
-            nav.locator("button.search-reusables__all-filters-pill-button").first if await nav.count() else None,
-            p.locator("button.search-reusables__all-filters-pill-button").first,
-            nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first if await nav.count() else None,
-            p.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first,
-        ]
-
+        # Try in-nav first, then global
         btn = None
-        for cand in candidates:
-            try:
-                if cand and await cand.count():
-                    btn = cand
-                    break
-            except Exception:
-                continue
+        if nav:
+            for sel in self._sel("all_filters_button"):
+                cand = nav.locator(sel).first
+                if await cand.count():
+                    btn = cand; break
+
+        if not btn:
+            for sel in self._sel("all_filters_button"):
+                cand = p.locator(sel).first
+                if await cand.count():
+                    btn = cand; break
 
         if not btn:
             await self._shot("all-filters-button-not-found")
@@ -873,7 +1060,7 @@ class WebCrawler(SecureCookieMixin):
     async def _wait_toolbar_ready(self, timeout_ms: int = 10_000):
         """Wait until the SDUI toolbar is attached and has its radio items."""
         p = self.page; assert p
-        tb = p.locator("div[role='toolbar']").first
+        tb = p.locator(_join(SELECTORS["toolbar"])).first
         await tb.wait_for(state="visible", timeout=timeout_ms)
 
         # Wait until at least one radio exists and a label is present
@@ -964,7 +1151,7 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             return await self._verify_2nd_checked()
 
-    # Keep these robust helpers for any other flows (unchanged)
+    # --- legacy robust helpers kept (unchanged logic) ---
     async def _wait_filters_toolbar_hydrated(self, timeout_ms: int = 15_000) -> None:
         """Wait until the lazyLoadedFilterBar renders a visible toolbar with radios."""
         p = self.page; assert p
@@ -1072,7 +1259,6 @@ class WebCrawler(SecureCookieMixin):
 
         return False
 
-    # --- simplified facades for your previous methods ---
     async def _select_second_degree_toolbar_first(self) -> None:
         self.log("[filters] simple toolbar path → click '2nd'")
         ok = await self._click_second_degree_simple(timeout_ms=15_000)
@@ -1101,6 +1287,8 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+    # ------------------------ Pagination helpers ------------------------
+
     async def locate_within_scroll(self, text, MAX_SCROLLS=5, DELAY=1):
         for i in range(MAX_SCROLLS):
             next_button = self.page.locator(text)
@@ -1112,39 +1300,33 @@ class WebCrawler(SecureCookieMixin):
 
     async def _find_next_button(self):
         p = self.page
-
-        pagination = p.locator("div.artdeco-pagination").last
+        # Bring pagination into view if present
+        pagination = await self._first_present("pagination_container")
         try:
-            if await pagination.count():
+            if pagination:
                 await pagination.scroll_into_view_if_needed()
                 await p.wait_for_timeout(150)
         except Exception:
             pass
 
-        candidates = [
-            p.locator("button[data-testid='pagination-controls-next-button-visible']").first,
-            p.locator("button.artdeco-pagination__button--next").first,
-            p.locator("button[aria-label='Next']").first,
-            p.get_by_role("button", name=re.compile(r"^\s*Next\s*$", re.I)).first,
-            p.locator("nav[aria-label='Pagination'] button[aria-label='Next']").first,
-        ]
-
-        for cand in candidates:
+        for sel in self._sel("pagination_next_button"):
             try:
+                cand = p.locator(sel).first
                 if await cand.count():
                     return cand
             except Exception:
                 continue
-
         return None
 
     async def _click_next_or_stop(self) -> bool:
         p = self.page
 
+        # If LinkedIn exposes a hidden-next sentinel, stop
         try:
-            if await p.locator("button[data-testid='pagination-controls-next-button-hidden']").count():
-                self.log("[page] next is hidden → last page")
-                return False
+            for sel in self._sel("pagination_next_hidden"):
+                if await p.locator(sel).count():
+                    self.log("[page] next is hidden → last page")
+                    return False
         except Exception:
             pass
 
@@ -1156,17 +1338,15 @@ class WebCrawler(SecureCookieMixin):
         page_number_fallback = None
         if not btn:
             try:
-                active_li = p.locator(
-                    "div.artdeco-pagination ul.artdeco-pagination__pages li.active, "
-                    "ul.artdeco-pagination__pages li.active, "
-                    "li.artdeco-pagination__indicator.active, "
-                    "li.artdeco-pagination__indicator.selected"
-                ).first
-
-                if await active_li.count():
-                    page_number_fallback = active_li.locator("~ li button").first
-                    if not await page_number_fallback.count():
-                        page_number_fallback = active_li.locator("xpath=following-sibling::li[1]//button").first
+                # Try to find the active page <li> and click the next sibling button
+                for sel in self._sel("pagination_active_li"):
+                    active_li = p.locator(sel).first
+                    if await active_li.count():
+                        page_number_fallback = active_li.locator("~ li button").first
+                        if not await page_number_fallback.count():
+                            page_number_fallback = active_li.locator("xpath=following-sibling::li[1]//button").first
+                        if await page_number_fallback.count():
+                            break
             except Exception:
                 pass
 
@@ -1198,7 +1378,8 @@ class WebCrawler(SecureCookieMixin):
                 ([prevPage, prevKey]) => {
                   const pageEl =
                     document.querySelector('button[aria-current="true"][aria-label^="Page"] span') ||
-                    document.querySelector('li.active button[aria-label^="Page"] span');
+                    document.querySelector('li.active button[aria-label^="Page"] span') ||
+                    document.querySelector('li.selected button[aria-label^="Page"] span');
                   const curPage = pageEl ? pageEl.textContent.trim() : null;
 
                   const card = document.querySelector(
@@ -1224,23 +1405,22 @@ class WebCrawler(SecureCookieMixin):
         return True
 
     async def _current_page_label(self) -> str | None:
-        el = self.page.locator(
-            'button[aria-current="true"][aria-label^="Page"] span, li.active button[aria-label^="Page"] span'
-        ).first
-        if await el.count():
-            try:
-                return (await el.text_content() or "").strip()
-            except Exception:
-                return None
+        for sel in self._sel("pagination_page_label"):
+            el = self.page.locator(sel).first
+            if await el.count():
+                try:
+                    return (await el.text_content() or "").strip()
+                except Exception:
+                    return None
         return None
 
     async def _first_result_key(self) -> str | None:
         card = self.page.locator(
-            '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn], li.reusable-search__result-container'
+            _join(SELECTORS["result_cards"])
         ).first
         if await card.count():
             try:
-                link = card.locator('a[href*="linkedin.com/in/"]').first
+                link = card.locator(_join(SELECTORS["profile_link_in_card"])).first
                 if await link.count():
                     href = await link.get_attribute("href")
                     if href:
@@ -1250,67 +1430,3 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 return None
         return None
-
-
-    def _result_cards_union(self):
-        """
-        Broad union of result-card selectors, filtered to only cards that contain a profile link (/in/).
-        This keeps us layout-agnostic and avoids ads / widgets.
-        """
-        p = self.page; assert p
-        union = ", ".join(self.RESULT_CARD_SELECTORS)
-        cards = p.locator(union)
-        return cards.filter(has=p.locator('a[href*="/in/"]'))
-
-    async def _maybe_scoped_cards(self):
-        """
-        Prefer scoping to the container if (and only if) it exists *and* contains results.
-        Fallback to the page-wide union otherwise.
-        """
-        p = self.page; assert p
-        base = self._result_cards_union()
-        container = p.locator("div.search-results-container").first
-        try:
-            # Only scope if container exists AND holds at least one valid card
-            if await container.count() > 0:
-                scoped = container.locator(", ".join(self.RESULT_CARD_SELECTORS))
-                scoped = scoped.filter(has=p.locator('a[href*="/in/"]'))
-                if await scoped.count() > 0:
-                    return scoped
-        except Exception:
-            pass
-        return base
-
-    async def _card_name_and_url(self, card):
-        """
-        Extract just {name, url} from a result card.
-        - URL: first profile link
-        - Name: prefer lockup title, then the anchor text
-        - Normalize URL: absolute + strip ?query#fragment
-        """
-        # URL
-        link = card.locator('a[href*="/in/"]').first
-        href = await link.get_attribute("href") if await link.count() else None
-        url = (href or "").strip() or None
-        if url:
-            # absolutize if needed
-            if url.startswith("/"):
-                base = self.URL.rstrip("/")
-                url = f"{base}{url}"
-            # strip query/fragment
-            url = url.split("?", 1)[0].split("#", 1)[0]
-
-        # NAME (prefer lockup title)
-        name_loc = card.locator(
-            '[data-view-name="search-result-lockup-title"] a, '
-            'a[data-view-name="search-result-lockup-title"], '
-            'a[href*="/in/"]'
-        ).first
-        name_txt = ""
-        try:
-            name_txt = (await name_loc.text_content() or "").strip()
-        except Exception:
-            pass
-        name = name_txt or "(unknown)"
-
-        return {"name": name, "url": url}
