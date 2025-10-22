@@ -451,10 +451,8 @@ class WebCrawler(SecureCookieMixin):
         await p.wait_for_timeout(400)
 
     def _result_cards(self):
-        p = self.page; assert p
-        combined = ", ".join(self.RESULT_CARD_SELECTORS)
-        container = p.locator("div.search-results-container").first
-        return (container.locator(combined) if container else p.locator(combined))
+        # NOTE: kept sync to preserve signature; don't do async counts here.
+        return self._result_cards_union()
 
     # -------- main flows --------
     async def start_company_flow(self, company: str):
@@ -649,41 +647,26 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+        seen = set()  # de-dupe by normalized URL
         page_i = 1
         while True:
             self.log(f"[page{page_i}] wait results")
             await self._wait_for_results()
             await self._shot(f"page-{page_i}-results")
 
-            cards = await self._result_cards().all()
+            cards_loc = await self._maybe_scoped_cards()
+            cards = await cards_loc.all()
             self.log(f"[page{page_i}] cards={len(cards)}")
 
             for i, card in enumerate(cards):
                 try:
-                    link = card.locator('a[href*="linkedin.com/in/"]').first
-                    if not await link.count():
-                        link = card.locator('a[data-view-name="search-result-lockup-title"]').first
-                    if not await link.count():
-                        link = card.locator(".linked-area a[href]").first
-
-                    href = await link.get_attribute("href") if await link.count() else None
-
-                    # Extract a name
-                    name_span = card.locator("a span[aria-hidden='true']").first
-                    name = (await name_span.inner_text()).strip() if await name_span.count() else None
-                    if not name and await link.count():
-                        txt = await link.inner_text()
-                        name = (txt or "").strip()
-
-                    # Skip non-result widgets (e.g., feedback card)
-                    dvn = (await card.get_attribute("data-view-name")) or ""
-                    if dvn in ("search-feedback-card", "SERP_TASK_MODULE"):
-                        continue
-
-                    if href and "linkedin.com/in/" in href:
-                        out_names.append(name or "(unknown)")
-                        out_urls.append(href)
-                        self.log(f"[✓] {(name or '(unknown)')} → {href}")
+                    item = await self._card_name_and_url(card)
+                    url = item["url"]
+                    if url and url not in seen:
+                        seen.add(url)
+                        out_names.append(item["name"])
+                        out_urls.append(url)
+                        self.log(f"[✓] {item['name']} → {url}")
                 except Exception as e:
                     self.log(f"[!] Error on card {i}: {e}")
 
@@ -701,7 +684,7 @@ class WebCrawler(SecureCookieMixin):
                         '[data-view-name^="search-entity-result"], [data-view-name="people-search-result"], [data-chameleon-result-urn], li.reusable-search__result-container'
                       );
                       if (!card) return false;
-                      const link = card.querySelector('a[href*="linkedin.com/in/"]');
+                      const link = card.querySelector('a[href*="/in/"]');
                       const curKey = link?.getAttribute('href') || (card.textContent || '').trim().slice(0, 200);
                       return curKey && curKey !== prevKey;
                     }
@@ -1267,3 +1250,67 @@ class WebCrawler(SecureCookieMixin):
             except Exception:
                 return None
         return None
+
+
+    def _result_cards_union(self):
+        """
+        Broad union of result-card selectors, filtered to only cards that contain a profile link (/in/).
+        This keeps us layout-agnostic and avoids ads / widgets.
+        """
+        p = self.page; assert p
+        union = ", ".join(self.RESULT_CARD_SELECTORS)
+        cards = p.locator(union)
+        return cards.filter(has=p.locator('a[href*="/in/"]'))
+
+    async def _maybe_scoped_cards(self):
+        """
+        Prefer scoping to the container if (and only if) it exists *and* contains results.
+        Fallback to the page-wide union otherwise.
+        """
+        p = self.page; assert p
+        base = self._result_cards_union()
+        container = p.locator("div.search-results-container").first
+        try:
+            # Only scope if container exists AND holds at least one valid card
+            if await container.count() > 0:
+                scoped = container.locator(", ".join(self.RESULT_CARD_SELECTORS))
+                scoped = scoped.filter(has=p.locator('a[href*="/in/"]'))
+                if await scoped.count() > 0:
+                    return scoped
+        except Exception:
+            pass
+        return base
+
+    async def _card_name_and_url(self, card):
+        """
+        Extract just {name, url} from a result card.
+        - URL: first profile link
+        - Name: prefer lockup title, then the anchor text
+        - Normalize URL: absolute + strip ?query#fragment
+        """
+        # URL
+        link = card.locator('a[href*="/in/"]').first
+        href = await link.get_attribute("href") if await link.count() else None
+        url = (href or "").strip() or None
+        if url:
+            # absolutize if needed
+            if url.startswith("/"):
+                base = self.URL.rstrip("/")
+                url = f"{base}{url}"
+            # strip query/fragment
+            url = url.split("?", 1)[0].split("#", 1)[0]
+
+        # NAME (prefer lockup title)
+        name_loc = card.locator(
+            '[data-view-name="search-result-lockup-title"] a, '
+            'a[data-view-name="search-result-lockup-title"], '
+            'a[href*="/in/"]'
+        ).first
+        name_txt = ""
+        try:
+            name_txt = (await name_loc.text_content() or "").strip()
+        except Exception:
+            pass
+        name = name_txt or "(unknown)"
+
+        return {"name": name, "url": url}
