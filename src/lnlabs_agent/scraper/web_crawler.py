@@ -774,46 +774,80 @@ class WebCrawler(SecureCookieMixin):
 
     async def _open_connections_filter(self) -> None:
         """
-        Open the 'Connections' filter panel.
-        First tries a dedicated 'Connections' pill; if not present, opens the All filters modal.
+        Open the 'Connections' filter panel. Supports:
+        - Classic nav pills
+        - Toolbar-only SDUI (no nav)
+        - Direct 'All filters' button in either area
         """
         p = self.page; assert p
-        nav = self._filters_nav()
-
         self.log("[filters] open 'Connections' filter")
 
-        # Variant A: a pill/tab “Connections” directly on the bar
-        try:
-            # Try several ways to find it
-            cand = None
+        # Try inside the classic nav first
+        nav = self._filters_nav()
+        if await nav.count():
+            # Variant A: a pill/tab “Connections”
             try:
-                cand = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I)).first
-                await cand.wait_for(timeout=1500)
+                btn = nav.get_by_role("button", name=re.compile(r"\bConnections\b", re.I)).first
+                await btn.wait_for(timeout=2000)
+                await btn.click()
+                await self._shot("connections-pill-open")
+                return
             except Exception:
                 pass
-            if not cand or not await cand.count():
-                cand = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
-            if cand and await cand.count():
-                await cand.scroll_into_view_if_needed()
-                await cand.click()
-                await self._shot("connections-pill-open")
+
+            # Variant A2: data attribute
+            try:
+                pill = nav.locator("[data-test-reusables-filters__filter-pill='CONNECTIONS']").first
+                await pill.wait_for(timeout=1500)
+                await pill.click()
+                await self._shot("connections-pill-dataattr")
+                return
+            except Exception:
+                pass
+
+            # Variant C: 'All filters' button in nav
+            try:
+                allf = nav.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
+                await allf.wait_for(timeout=2000)
+                await allf.click()
+                await self._shot("all-filters-open")
+                return
+            except Exception:
+                pass
+
+        # If nav path failed or nav absent, look for toolbar “All filters” (SDUI)
+        try:
+            tb = p.locator("div[role='toolbar']").first
+            if await tb.count():
+                # Visible text button
+                allf_tb = tb.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
+                if await allf_tb.count():
+                    await allf_tb.scroll_into_view_if_needed()
+                    await allf_tb.click()
+                    await self._shot("all-filters-open-toolbar")
+                    return
+                # Fallback: any button with that text within toolbar subtree
+                allf_any = tb.locator("button", has_text=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
+                if await allf_any.count():
+                    await allf_any.scroll_into_view_if_needed()
+                    await allf_any.click()
+                    await self._shot("all-filters-open-toolbar-fallback")
+                    return
+        except Exception:
+            pass
+
+        # As a last resort, global search for an All filters button
+        try:
+            allf_global = p.get_by_role("button", name=re.compile(r"^\s*All\s+filters\s*$", re.I)).first
+            if await allf_global.count():
+                await allf_global.click()
+                await self._shot("all-filters-open-global")
                 return
         except Exception:
             pass
 
-        # Variant B: no pill → open All filters modal (robust)
-        self.log("[filters] 'Connections' pill not visible → opening All filters modal")
-        dlg = await self._open_all_filters()
-        await self._shot("all-filters-open")
-
-        # Best-effort: make sure the Connections section is in view in the modal
-        try:
-            conn_head = dlg.get_by_role("heading", name=re.compile(r"\bConnections\b", re.I)).first
-            if await conn_head.count():
-                await conn_head.scroll_into_view_if_needed()
-                await p.wait_for_timeout(150)
-        except Exception:
-            pass
+        await self._shot("connections-open-failed")
+        raise TimeoutError("Could not open Connections / All filters UI")
 
     async def _open_all_filters(self):
         """
@@ -884,17 +918,35 @@ class WebCrawler(SecureCookieMixin):
 
 
     async def _select_second_degree(self) -> None:
-        p = self.page
-        assert p
-
+        p = self.page; assert p
         self.log("[filters] selecting 2nd-degree")
 
-        # radio by name (regex)
+        # 1) SDUI/new toolbar: click the label '2nd' (most reliable)
+        sdui_label = p.locator("div[role='toolbar'] label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
+        if await sdui_label.count():
+            try:
+                await sdui_label.scroll_into_view_if_needed()
+            except Exception:
+                pass
+            try:
+                await sdui_label.wait_for(state="attached", timeout=2000)
+            except Exception:
+                pass
+            await sdui_label.click(force=True)
+            await self._shot("2nd-selected-sdui-label")
+            try:
+                await p.wait_for_load_state("networkidle", timeout=5_000)
+            except Exception:
+                await p.wait_for_timeout(600)
+            return
+
+        # 2) ARIA radio by name (works in some builds)
         try:
-            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd", re.I))
-            await radio.wait_for(timeout=2500)
+            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
+            await radio.wait_for(timeout=2000)
+            await radio.scroll_into_view_if_needed()
             await radio.click()
-            await self._shot("2nd-selected-radio")
+            await self._shot("2nd-selected-aria-radio")
             try:
                 await p.wait_for_load_state("networkidle", timeout=5_000)
             except Exception:
@@ -903,10 +955,11 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # aria-label button
+        # 3) Button with aria-label '2nd' (legacy multiselect pills)
         try:
             btn = p.locator("button[aria-label='2nd']").first
-            await btn.wait_for(timeout=2500)
+            await btn.wait_for(timeout=2000)
+            await btn.scroll_into_view_if_needed()
             await btn.click()
             await self._shot("2nd-selected-button")
             try:
@@ -917,25 +970,12 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # label “2nd”
-        try:
-            lab = p.get_by_label("2nd")
-            await lab.wait_for(timeout=2500)
-            await lab.click()
-            await self._shot("2nd-selected-label")
-            try:
-                await p.wait_for_load_state("networkidle", timeout=5_000)
-            except Exception:
-                await p.wait_for_timeout(600)
-            return
-        except Exception:
-            pass
-
-        # generic label text
+        # 4) Any plain label "2nd" anywhere (ultimate catch-all, including filter modals)
         try:
             lab = p.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
-            await lab.wait_for(timeout=2500)
-            await lab.click()
+            await lab.wait_for(timeout=2000)
+            await lab.scroll_into_view_if_needed()
+            await lab.click(force=True)
             await self._shot("2nd-selected-generic-label")
             try:
                 await p.wait_for_load_state("networkidle", timeout=5_000)
@@ -961,71 +1001,90 @@ class WebCrawler(SecureCookieMixin):
 
     async def _select_second_degree_toolbar_first(self) -> None:
         """
-        Prefer new UI multiselect pills (1st/2nd/3rd+). If missing, try the legacy
-        toolbar radios inside div[role='toolbar'] before letting the caller fall
-        back to the All filters panel.
+        Prefer toolbar chips when present (new SDUI renders them as div[role='radio'] + <label>2nd</label>).
+        If the chips aren't available, fall back to legacy pills/radios; finally open the Connections modal.
         """
         p = self.page; assert p
-        self.log("[filters] try multiselect pills for 1st/2nd/3rd+]")
+        self.log("[filters] try multiselect pills / toolbar radios for 1st/2nd/3rd+]")
 
-        nav = self._filters_nav()
-        await nav.wait_for(timeout=7000)
+        # Wait for either the classic filters nav OR the new SDUI toolbar to be attached
+        try:
+            await self.wait_for_any(
+                [
+                    "nav[aria-label='Search filters']",
+                    "div[role='toolbar']",
+                ],
+                timeout=7000,
+            )
+        except Exception:
+            self.log("[filters] no toolbar/nav attached yet")
+            await self._open_connections_filter()
+            return
 
-        # (1) New UI: multiselect pills
-        btn = nav.locator(
-            "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
-        ).first
-        if not await btn.count():
-            btn = nav.locator(
-                "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
-            ).first
-        if await btn.count():
-            await btn.scroll_into_view_if_needed()
-            await btn.wait_for(state="visible", timeout=3000)
-            await btn.click()
+        # Always try to bring the toolbar area into view
+        try:
+            tb = p.locator("div[role='toolbar']").first
+            if await tb.count():
+                await tb.scroll_into_view_if_needed()
+                await p.wait_for_timeout(120)
+        except Exception:
+            pass
+
+        # (A) New SDUI: click the label '2nd' inside the toolbar
+        sdui_label = p.locator("div[role='toolbar'] label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
+        if await sdui_label.count():
             try:
-                await btn.wait_for_function("el => el.getAttribute('aria-pressed') === 'true'", timeout=2000)
+                await sdui_label.wait_for(state="attached", timeout=2000)
             except Exception:
                 pass
-            await self._shot("2nd-selected-multiselect")
+            await sdui_label.click(force=True)
+            await self._shot("2nd-selected-sdui-label")
             try:
                 await p.wait_for_load_state("networkidle", timeout=5_000)
             except Exception:
-                await p.wait_for_timeout(600)
+                await p.wait_for_timeout(500)
             return
 
-        # (2) Legacy UI: radios/labels inside a toolbar
-        self.log("[filters] multiselect not found → try legacy toolbar radios")
-        toolbar = p.locator("div[role='toolbar']").first
+        # (B) ARIA radio by role/name (some builds expose this)
         try:
-            await toolbar.wait_for(timeout=2500)
-            # radio by role/name
-            radio = toolbar.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
+            radio = p.get_by_role("radio", name=re.compile(r"^\s*2nd\s*$", re.I)).first
             if await radio.count():
                 await radio.scroll_into_view_if_needed()
                 await radio.click()
-                await self._shot("2nd-selected-legacy-radio")
+                await self._shot("2nd-selected-aria-radio")
                 try:
                     await p.wait_for_load_state("networkidle", timeout=5_000)
                 except Exception:
-                    await p.wait_for_timeout(600)
-                return
-            # or explicit label inside toolbar
-            lab = toolbar.locator("label", has_text=re.compile(r"^\s*2nd\s*$", re.I)).first
-            if await lab.count():
-                await lab.scroll_into_view_if_needed()
-                await lab.click()
-                await self._shot("2nd-selected-legacy-label")
-                try:
-                    await p.wait_for_load_state("networkidle", timeout=5_000)
-                except Exception:
-                    await p.wait_for_timeout(600)
+                    await p.wait_for_timeout(500)
                 return
         except Exception:
             pass
 
-        # (3) Neither variant is present → open modal path and let the caller reuse its selection flow
-        self.log("[filters] neither pill nor legacy toolbar found → using All filters modal")
+        # (C) Legacy pills in the filters nav
+        try:
+            nav = self._filters_nav()
+            if await nav.count():
+                btn = nav.locator(
+                    "ul.search-reusables__multiselect-pill-list button[aria-label='2nd']"
+                ).first
+                if not await btn.count():
+                    btn = nav.locator(
+                        "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+                    ).first
+                if await btn.count():
+                    await btn.scroll_into_view_if_needed()
+                    await btn.click()
+                    await self._shot("2nd-selected-multiselect")
+                    try:
+                        await p.wait_for_load_state("networkidle", timeout=5_000)
+                    except Exception:
+                        await p.wait_for_timeout(500)
+                    return
+        except Exception:
+            pass
+
+        # (D) Nothing clickable found → open modal path and let caller continue
+        self.log("[filters] toolbar chips not clickable → using All filters modal")
         await self._open_connections_filter()
 
     async def _click_companies_tab_simple(self) -> None:
