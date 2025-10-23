@@ -208,18 +208,20 @@ class WebCrawler(SecureCookieMixin):
         self.CONNECTIONS_CONTAINER_SELECTORS = [
             # Old/radio toolbar
             "div[role='toolbar']",
-            # New/pill list
+            # New multiselect pills
             "ul.search-reusables__multiselect-pill-list",
-            # SDUI / lazyLoadedFilterBar (new variant you pasted)
+            # SDUI / lazyLoadedFilterBar wrappers
             "[data-sdui-component*='lazyLoadedFilterBar']",
             "[componentkey='SearchResults_SearchResultsFilterBar']",
+            # Fallback to the bar wrapper class batch (harmless if absent)
+            "#search-reusables__filters-bar",
         ]
 
         self.CONNECTIONS_2ND_SELECTORS = [
-            # New SDUI radio-toolbar variants (label text lives inside the radio item)
+            # SDUI radio-toolbar: the label holds the text
             "div[role='toolbar'] [role='radio'] label:has-text('2nd')",
             "div[role='toolbar'] [role='radio']:has(label:has-text('2nd'))",
-            # Old toolbar/radio style
+            # Older radio-toolbar variants
             "div[role='toolbar'] label:has-text('2nd')",
             "div[role='toolbar'] div[role='radio']:has-text('2nd')",
             "div[role='toolbar'] [aria-label*='2nd' i]",
@@ -1095,20 +1097,20 @@ class WebCrawler(SecureCookieMixin):
     # --- simplified “2nd” selection path (no All Filters, no scrolling) ---
     async def _wait_connections_ui_ready(self, timeout_ms: int = 10_000):
         p = self.page; assert p
-        sels = self.CONNECTIONS_CONTAINER_SELECTORS
-        # Wait for ANY container…
+        # Wait for ANY of our containers
         await p.wait_for_function(
             """(sels)=>sels.some(s=>document.querySelector(s))""",
-            arg=sels, timeout=timeout_ms
+            arg=self.CONNECTIONS_CONTAINER_SELECTORS,
+            timeout=timeout_ms
         )
-        # …and then ensure at least one radio or pill exists
+        # Then ensure either radios or pill buttons exist
         try:
             await p.wait_for_selector(
                 "div[role='toolbar'] [role='radio'], ul.search-reusables__multiselect-pill-list button",
                 timeout=timeout_ms
             )
         except Exception:
-            # give SDUI a beat to hydrate
+            # Give SDUI one extra beat to hydrate
             await p.wait_for_timeout(300)
 
 
@@ -1138,19 +1140,17 @@ class WebCrawler(SecureCookieMixin):
         await self._wait_connections_ui_ready(timeout_ms)
         await self._dismiss_open_popovers()
 
-        # Bring filters bar into view if present
+        # Bring the bar into view if possible
         try:
             nav = await self._first_present("search_filters_nav")
             if nav:
                 await nav.scroll_into_view_if_needed()
-                await p.wait_for_timeout(100)
+                await p.wait_for_timeout(80)
         except Exception:
             pass
 
-        # Try candidates in priority (SDUI radios → old radios → new pills → generic)
-        candidates_in_order = list(self.CONNECTIONS_2ND_SELECTORS)
-
-        for sel in candidates_in_order:
+        # Try candidates in priority order
+        for sel in list(self.CONNECTIONS_2ND_SELECTORS):
             try:
                 target = p.locator(sel).first
                 if not await target.count():
@@ -1158,51 +1158,49 @@ class WebCrawler(SecureCookieMixin):
 
                 try: await target.scroll_into_view_if_needed()
                 except: pass
-                try: await target.wait_for(state="visible", timeout=1500)
+                try: await target.wait_for(state="visible", timeout=1200)
                 except: pass
 
-                # 1) Click the target normally
-                if await self.click_with_retry(target, attempts=3, delay_ms=160):
+                # 1) Normal click
+                if await self.click_with_retry(target, attempts=3, delay_ms=140):
                     if await self._verify_connections_2nd_selected():
                         return True
 
-                # 2) If this is the SDUI radio flavor, click the closest radio and try Space on it
+                # 2) If the match is the label inside a radio item, click the closest radio & Space
                 try:
-                    await p.evaluate(
-                        """(sel) => {
+                    clicked = await p.evaluate("""
+                        (sel) => {
                           const t = document.querySelector(sel);
                           if (!t) return false;
-                          const radio = t.closest('[role="radio"]') || t;
+                          const radio = t.closest('[role="radio"]') || t.closest('div[role="radio"]');
+                          if (!radio) return false;
                           radio.click();
                           radio.focus && radio.focus();
                           return true;
-                        }""",
-                        sel,
-                    )
-                    await p.keyboard.press("Space")
+                        }
+                    """, sel)
+                    if clicked:
+                        await p.keyboard.press("Space")
+                        await p.wait_for_timeout(220)
+                        if await self._verify_connections_2nd_selected():
+                            return True
                 except Exception:
                     pass
 
-                # Tiny delay for aria to flip
-                await p.wait_for_timeout(250)
-                if await self._verify_connections_2nd_selected():
-                    return True
-
-                # 3) Force click via JS as last resort
+                # 3) As a last resort, force-click via JS on the target
                 try:
-                    await p.evaluate("(el)=>el.click()", target)
+                    await p.evaluate("(el)=>{el.click(); el.dispatchEvent(new MouseEvent('click', {bubbles:true}));}", target)
                 except Exception:
                     pass
-
-                await p.wait_for_timeout(200)
+                await p.wait_for_timeout(180)
                 if await self._verify_connections_2nd_selected():
                     return True
+
             except Exception:
                 continue
 
-        # 4) All else fails → All Filters modal path
+        # 4) Fallback: open All Filters and set Connections=2nd there (if you have this path)
         return await self._set_2nd_via_all_filters()
-
 
 
     # --- legacy robust helpers kept (unchanged logic) ---
@@ -1563,7 +1561,7 @@ class WebCrawler(SecureCookieMixin):
     async def _verify_connections_2nd_selected(self) -> bool:
         p = self.page; assert p
 
-        # SDUI / modern radio-toolbar: check aria-checked on the radio hosting '2nd'
+        # SDUI / modern radio-toolbar (label inside [role=radio])
         try:
             r = p.locator("div[role='toolbar'] [role='radio']:has(label:has-text('2nd'))").first
             if await r.count():
@@ -1583,7 +1581,7 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # New pill buttons variant (aria-pressed or selected class)
+        # Multiselect pill buttons (newer non-radio UI)
         try:
             btn = p.locator(
                 "ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], "
@@ -1591,7 +1589,6 @@ class WebCrawler(SecureCookieMixin):
             ).first
             if await btn.count():
                 pressed = (await btn.get_attribute("aria-pressed") or "").lower() == "true"
-                # class-based selection sometimes used by LI experiments
                 cls = (await btn.get_attribute("class") or "")
                 selected_cls = "search-reusables__multiselect-pill-button--selected" in cls
                 if pressed or selected_cls:
@@ -1599,7 +1596,7 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # Generic fallback
+        # Generic guard: honor aria-pressed/aria-checked anywhere
         try:
             any_btn = p.locator("button[aria-label='2nd'], button:has-text('2nd')").first
             if await any_btn.count():
@@ -1686,15 +1683,22 @@ class WebCrawler(SecureCookieMixin):
 
     async def _dismiss_open_popovers(self):
         p = self.page; assert p
+        # Close artdeco hoverable / dropdowns
         try:
-            # hit Escape a couple of times
             await p.keyboard.press("Escape")
             await p.wait_for_timeout(100)
-            await p.keyboard.press("Escape")
         except Exception:
             pass
-        # try clicking outside the filters bar
         try:
-            await p.mouse.click(5, 5)
+            # Hide any visible hoverables
+            await p.evaluate("""
+                () => {
+                  document.querySelectorAll('.artdeco-hoverable-content[aria-hidden="false"]')
+                    .forEach(el => el.setAttribute('aria-hidden', 'true'));
+                  document.querySelectorAll('[aria-expanded="true"][data-view-name="search-filter-top-bar-select"]')
+                    .forEach(el => el.setAttribute('aria-expanded','false'));
+                }
+            """)
         except Exception:
             pass
+
