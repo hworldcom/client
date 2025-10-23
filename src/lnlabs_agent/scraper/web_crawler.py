@@ -45,6 +45,22 @@ SELECTORS = {
     "company_link_anywhere": [
         "a[href*='/company/']"
     ],
+    "profile_mutuals_link": [
+        "a[data-control-name='topcard_view_all_connections']",
+        "a[data-control-name='view_mutual_connections']",
+        "a[href*='/network/mutuals/']",
+        "a[href*='/search/results/people/?connectionOf=']",
+        "a[href*='connectionOf=%5B']",
+        "a:has-text('mutual connection')",
+        "a:has(span:has-text('Mutual connections'))",
+        "a:has-text('Mutual connections')",
+        "a:has(span:has-text('Mutual connection'))",
+        "a:has-text('Mutual connection')",
+        "button:has(span:has-text('Mutual connections'))",
+        "button:has-text('Mutual connections')",
+        "button:has(span:has-text('Mutual connection'))",
+        "button:has-text('Mutual connection')",
+    ],
     "search_filters_nav": [
         "nav[aria-label='Search filters']",
         "#search-reusables__filters-bar nav[aria-label='Search filters']",  # nested
@@ -712,6 +728,142 @@ class WebCrawler(SecureCookieMixin):
         await self._shot("after-company-flow")
         return names, urls
 
+    async def scrape_mutual_connections(
+        self,
+        profile_url: str,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Navigate to a profile, open the mutual connections list, and collect results.
+        Returns list of dicts with keys: name, url, source_profile.
+        """
+        self.log(f"[mutuals] profile={profile_url}")
+        p = self.page; assert p
+        ok = await self.safe_goto(profile_url, max_retries=3)
+        if not ok:
+            raise RuntimeError(f"Failed to load profile: {profile_url}")
+
+        await self.wait_network_quiet()
+        await p.wait_for_timeout(_ms(0.6, 1.2))
+        try:
+            await p.wait_for_selector("main", timeout=8_000)
+        except Exception:
+            pass
+        await self._shot("profile-opened")
+
+        # Try to locate the mutual connections entry point.
+        btn = await self._first_present("profile_mutuals_link")
+        if not btn:
+            self.log("[mutuals] mutual connections control not found.")
+            await self._shot("mutuals-link-missing")
+            return []
+
+        try:
+            await btn.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await btn.wait_for(state="visible", timeout=4_000)
+        except Exception:
+            pass
+
+        if not await self.click_with_retry(btn, attempts=3, delay_ms=200):
+            self.log("[mutuals] click_on_mutuals_failed")
+            await self._shot("mutuals-click-failed")
+            return []
+
+        await p.wait_for_timeout(_ms(1.5, 2.8))
+        try:
+            await self.wait_network_quiet()
+        except Exception:
+            pass
+        await self._shot("mutuals-opened")
+
+        names: list[str] = []
+        urls: list[str] = []
+        try:
+            await self._extract_data_names_urls(names, urls, limit=limit)
+        except Exception as e:
+            self.log(f"[mutuals] extraction error: {e}")
+
+        rows: list[dict] = []
+        for name, url in zip(names, urls):
+            if not url:
+                continue
+            rows.append(
+                {
+                    "name": name,
+                    "url": url,
+                    "source_profile": profile_url,
+                }
+            )
+            if limit and len(rows) >= limit:
+                break
+
+        if not rows:
+            fallback = await self._collect_mutuals_from_modal(profile_url, limit=limit)
+            if fallback:
+                rows = fallback
+
+        self.log(f"[mutuals] collected {len(rows)} connections")
+        return rows
+
+    async def _collect_mutuals_from_modal(
+        self,
+        profile_url: str,
+        limit: Optional[int] = None,
+    ) -> list[dict]:
+        """
+        Fallback collector for variants where mutual connections render in a modal overlay.
+        """
+        p = self.page; assert p
+        modal = p.locator("div[role='dialog']").filter(
+            has_text=re.compile(r"Mutual", re.I)
+        ).first
+        try:
+            if not await modal.count():
+                return []
+        except Exception:
+            return []
+
+        rows: list[dict] = []
+        seen: set[str] = set()
+        anchors = []
+        try:
+            anchors = await modal.locator("a[href*='/in/']").all()
+        except Exception:
+            anchors = []
+
+        for anchor in anchors:
+            try:
+                href = await anchor.get_attribute("href")
+                if not href:
+                    continue
+                href = href.strip()
+                if href.startswith("/"):
+                    href = self.URL.rstrip("/") + href
+                href = href.split("?", 1)[0].split("#", 1)[0]
+                if href in seen:
+                    continue
+                seen.add(href)
+                name = (await anchor.text_content() or "").strip() or "(unknown)"
+                rows.append(
+                    {
+                        "name": name,
+                        "url": href,
+                        "source_profile": profile_url,
+                    }
+                )
+                if limit and len(rows) >= limit:
+                    break
+            except Exception:
+                continue
+
+        if rows:
+            self.log(f"[mutuals] modal fallback collected {len(rows)} entries")
+            await self._shot("mutuals-modal-collected")
+        return rows
+
     async def _extract_data_urls_names_company(self, company: str, out_names: list[str], out_urls: list[str]):
 
         self.log("[step] go home before search")
@@ -771,7 +923,7 @@ class WebCrawler(SecureCookieMixin):
         await self.page.wait_for_timeout(1200)
         self.log("[step] open employees")
         await self._open_company_employees()
-        await self.page.wait_for_timeout(20000)
+        await self.page.wait_for_timeout(5000)
 
         self.log("[step] filter 2nd-degree (simple toolbar click)]")
         ok = await self._click_second_degree_simple(timeout_ms=15_000)
@@ -883,7 +1035,12 @@ class WebCrawler(SecureCookieMixin):
         finally:
             await self._shot("home-loaded")
 
-    async def _extract_data_names_urls(self, out_names: list[str], out_urls: list[str]):
+    async def _extract_data_names_urls(
+        self,
+        out_names: list[str],
+        out_urls: list[str],
+        limit: Optional[int] = None,
+    ):
         p = self.page; assert p
 
         try:
@@ -903,6 +1060,8 @@ class WebCrawler(SecureCookieMixin):
             self.log(f"[page{page_i}] cards={len(cards)}")
 
             for i, card in enumerate(cards):
+                if limit and len(out_urls) >= limit:
+                    break
                 try:
                     item = await self._card_name_and_url(card)
                     url = item["url"]
@@ -913,6 +1072,11 @@ class WebCrawler(SecureCookieMixin):
                         self.log(f"[✓] {item['name']} → {url}")
                 except Exception as e:
                     self.log(f"[!] Error on card {i}: {e}")
+                if limit and len(out_urls) >= limit:
+                    break
+
+            if limit and len(out_urls) >= limit:
+                break
 
             clicked = await self._click_next_or_stop()
             if not clicked:

@@ -137,24 +137,6 @@ def send_result(token: str, job_id: str, result: dict) -> None:
         raise RuntimeError(f"send_result failed: {r.status_code} {r.text[:500]}")
 
 # -------------------------
-# Optional: dummy generator for 'profiles' mode (placeholder)
-# -------------------------
-def dummy_profiles(urls: List[str]) -> Dict[str, Dict]:
-    """
-    For each profile URL return some dummy mutuals; if URL contains 'direct', say 1st.
-    """
-    out = {}
-    for u in urls:
-        degree = "1st" if "direct" in u else "2nd"
-        conns = [
-            {"url": f"{u.rstrip('/')}-mutual-1/", "degree": degree},
-            {"url": f"{u.rstrip('/')}-mutual-2/", "degree": "3rd" if degree != "1st" else "2nd"},
-        ]
-        out[u] = {"connections": conns}
-    time.sleep(1.5)
-    return out
-
-# -------------------------
 # Playwright bootstrap
 # -------------------------
 def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> None:
@@ -258,7 +240,15 @@ class AgentRunner(threading.Thread):
                 job_id = job.get("id")
                 urls   = job.get("urls") or []
                 mode   = (job.get("mode") or "profiles").lower()
-                self.log(f"Job {job_id} received mode={mode} ({len(urls)} items)")
+                limit_raw = job.get("limit")
+                limit = None
+                if limit_raw is not None:
+                    try:
+                        limit = int(limit_raw)
+                    except (TypeError, ValueError):
+                        limit = None
+                limit_note = f", limit={limit}" if limit is not None else ""
+                self.log(f"Job {job_id} received mode={mode} ({len(urls)} items{limit_note})")
 
                 if mode == "companies":
                     # Ensure chromium is installed in our managed cache
@@ -275,8 +265,7 @@ class AgentRunner(threading.Thread):
                     # Run the scraping flow in an async context-managed session
                     result = asyncio.run(self._companies_flow(urls))
                 else:
-                    # Placeholder for 'profiles' mode
-                    result = dummy_profiles(urls)
+                    result = asyncio.run(self._profiles_flow(urls, limit=limit))
 
                 self.log(f"[job {job_id}] sending result …")
                 send_result(self.token, job_id, result)
@@ -317,4 +306,28 @@ class AgentRunner(threading.Thread):
                 except Exception as e:
                     self.log(f"[job] company={comp} error: {e}")
                     result[comp] = {"error": str(e), "employees": []}
+        return result
+
+    async def _profiles_flow(self, urls: list[str], limit: Optional[int] = None) -> dict:
+        """
+        Scrape mutual connections for each profile URL supplied.
+        """
+        result: dict[str, dict] = {}
+        crawler = WebCrawler(
+            logger=self.log,
+            artifacts_dir=ARTIFACTS_DIR,
+            cookie_file=COOKIE_FILE,
+        )
+        async with crawler.session(headless=False):
+            await crawler.login_if_needed()
+            for profile in urls:
+                try:
+                    connections = await crawler.scrape_mutual_connections(profile, limit=limit)
+                    result[profile] = {
+                        "connections": connections,
+                        "count": len(connections),
+                    }
+                except Exception as e:
+                    self.log(f"[job] profile={profile} error: {e}")
+                    result[profile] = {"error": str(e), "connections": []}
         return result
