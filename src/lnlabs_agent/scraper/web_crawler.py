@@ -1,7 +1,7 @@
 # src/lnlabs_agent/scraper/web_crawler.py
 from __future__ import annotations
 
-import os, re, json, random, asyncio
+import os, re, json, random, asyncio, time
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional, Callable, List, Iterable
@@ -1149,57 +1149,56 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
-        # Try candidates in priority order
-        for sel in list(self.CONNECTIONS_2ND_SELECTORS):
+        # --- SDUI radio-toolbar path (most reliable): find the RADIO that has a label "2nd"
+        radio_group = p.locator("div[role='toolbar'] [role='radio']")
+        radio_2nd = radio_group.filter(has=p.locator("label", has_text=re.compile(r"\b2nd\b", re.I))).first
+        label_2nd = radio_2nd.locator("label", has_text=re.compile(r"\b2nd\b", re.I)).first
+
+        # Fallbacks (legacy + pills):
+        pill_2nd = p.locator("ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], ul.search-reusables__multiselect-pill-list button:has-text('2nd')").first
+        generic_2nd = p.locator("button[aria-label='2nd'], button:has-text('2nd')").first
+
+        # Try clicking the RADIO container first (preferred in SDUI)
+        for target in [radio_2nd, label_2nd, pill_2nd, generic_2nd]:
             try:
-                target = p.locator(sel).first
                 if not await target.count():
                     continue
-
                 try: await target.scroll_into_view_if_needed()
                 except: pass
-                try: await target.wait_for(state="visible", timeout=1200)
+                try: await target.wait_for(state="visible", timeout=1500)
                 except: pass
 
-                # 1) Normal click
+                # 1) Click normally (container first, then label/pill)
                 if await self.click_with_retry(target, attempts=3, delay_ms=140):
-                    if await self._verify_connections_2nd_selected():
+                    if await self._verify_connections_2nd_selected(wait_ms=1_200):
                         return True
 
-                # 2) If the match is the label inside a radio item, click the closest radio & Space
-                try:
-                    clicked = await p.evaluate("""
-                        (sel) => {
-                          const t = document.querySelector(sel);
-                          if (!t) return false;
-                          const radio = t.closest('[role="radio"]') || t.closest('div[role="radio"]');
-                          if (!radio) return false;
-                          radio.click();
-                          radio.focus && radio.focus();
-                          return true;
-                        }
-                    """, sel)
-                    if clicked:
+                # 2) If target is a RADIO container, Space often toggles it reliably
+                if target == radio_2nd:
+                    try:
+                        await target.focus()
+                    except Exception:
+                        pass
+                    try:
                         await p.keyboard.press("Space")
                         await p.wait_for_timeout(220)
-                        if await self._verify_connections_2nd_selected():
+                        if await self._verify_connections_2nd_selected(wait_ms=1_200):
                             return True
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
 
-                # 3) As a last resort, force-click via JS on the target
+                # 3) JS forced click
                 try:
-                    await p.evaluate("(el)=>{el.click(); el.dispatchEvent(new MouseEvent('click', {bubbles:true}));}", target)
+                    await p.evaluate("(el)=>{el.click(); el.dispatchEvent(new MouseEvent('click',{bubbles:true}));}", target)
+                    await p.wait_for_timeout(180)
+                    if await self._verify_connections_2nd_selected(wait_ms=1_200):
+                        return True
                 except Exception:
                     pass
-                await p.wait_for_timeout(180)
-                if await self._verify_connections_2nd_selected():
-                    return True
-
             except Exception:
                 continue
 
-        # 4) Fallback: open All Filters and set Connections=2nd there (if you have this path)
+        # 4) Fallback to All Filters path
         return await self._set_2nd_via_all_filters()
 
 
@@ -1558,57 +1557,158 @@ class WebCrawler(SecureCookieMixin):
         raise TimeoutError(f"Employees link not found on company page: {last_err}")
 
 
-    async def _verify_connections_2nd_selected(self) -> bool:
+    async def _verify_connections_2nd_selected(self, wait_ms: int = 0) -> bool:
         p = self.page; assert p
 
-        # SDUI / modern radio-toolbar (label inside [role=radio])
-        try:
-            r = p.locator("div[role='toolbar'] [role='radio']:has(label:has-text('2nd'))").first
-            if await r.count():
-                v = (await r.get_attribute("aria-checked") or "").lower()
-                if v == "true":
-                    return True
-        except Exception:
-            pass
+        async def _check() -> bool:
+            # --- A) SDUI / radio with label "2nd" (new + legacy hashed variants) ---
+            try:
+                radios = p.locator("div[role='toolbar'] [role='radio']").filter(
+                    has=p.locator("label", has_text=re.compile(r"\b2nd\b", re.I))
+                )
+                count = await radios.count()
+                for idx in range(min(count, 3)):
+                    r = radios.nth(idx)
+                    if not await r.count():
+                        continue
+                    try:
+                        if not await r.is_visible():
+                            continue
+                    except Exception:
+                        pass
+                    attrs = {
+                        "aria-checked": (await r.get_attribute("aria-checked") or "").lower(),
+                        "aria-selected": (await r.get_attribute("aria-selected") or "").lower(),
+                        "aria-pressed": (await r.get_attribute("aria-pressed") or "").lower(),
+                        "data-state": (await r.get_attribute("data-state") or "").lower(),
+                        "data-selected": (await r.get_attribute("data-selected") or "").lower(),
+                        "data-checked": (await r.get_attribute("data-checked") or "").lower(),
+                    }
+                    if any(
+                        attrs[key] in ("true", "mixed", "checked", "selected", "on")
+                        for key in attrs
+                    ):
+                        return True
+                    cls = (await r.get_attribute("class") or "")
+                    if any(tok in cls for tok in ("selected", "is-selected", "active", "--selected")):
+                        return True
+                    try:
+                        has_checked_input = await r.locator("input").evaluate_all(
+                            "(nodes) => nodes.some((el) => el.matches(':checked') || "
+                            "(el.getAttribute('aria-checked')||'').toLowerCase() === 'true' || "
+                            "(el.getAttribute('data-state')||'').toLowerCase() === 'checked')"
+                        )
+                        if has_checked_input:
+                            return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
-        # Old toolbar/radio variant
-        try:
-            radio = p.locator('div[role="toolbar"] div[role="radio"]').filter(has_text=SECOND_RX).first
-            if await radio.count():
-                v = (await radio.get_attribute("aria-checked") or "").lower()
-                if v == "true":
-                    return True
-        except Exception:
-            pass
+            # --- B) Classic radio-toolbar where text is on the radio itself (legacy) ---
+            try:
+                radio_legacy = p.locator("div[role='toolbar'] div[role='radio']").filter(has_text=SECOND_RX)
+                count = await radio_legacy.count()
+                for idx in range(min(count, 3)):
+                    radio = radio_legacy.nth(idx)
+                    if not await radio.count():
+                        continue
+                    attrs = {
+                        "aria-checked": (await radio.get_attribute("aria-checked") or "").lower(),
+                        "aria-selected": (await radio.get_attribute("aria-selected") or "").lower(),
+                        "aria-pressed": (await radio.get_attribute("aria-pressed") or "").lower(),
+                    }
+                    if any(attrs[key] in ("true", "mixed", "checked", "selected", "on") for key in attrs):
+                        return True
+                    cls = (await radio.get_attribute("class") or "")
+                    if any(tok in cls for tok in ("selected", "is-selected", "active", "--selected")):
+                        return True
+            except Exception:
+                pass
 
-        # Multiselect pill buttons (newer non-radio UI)
-        try:
-            btn = p.locator(
-                "ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], "
-                "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
-            ).first
-            if await btn.count():
-                pressed = (await btn.get_attribute("aria-pressed") or "").lower() == "true"
-                cls = (await btn.get_attribute("class") or "")
-                selected_cls = "search-reusables__multiselect-pill-button--selected" in cls
-                if pressed or selected_cls:
-                    return True
-        except Exception:
-            pass
+            # --- C) Check the associated INPUT (SDUI w/ hidden checkbox) ---
+            try:
+                labels = p.locator("div[role='toolbar'] label:has-text('2nd')")
+                count = await labels.count()
+                for idx in range(min(count, 3)):
+                    lab = labels.nth(idx)
+                    if not await lab.count():
+                        continue
+                    checked = await p.evaluate(
+                        """
+                        (el) => {
+                          const id = el.getAttribute('for');
+                          const hostRadio = el.closest('[role=\"radio\"], [data-view-name=\"search-filter-top-bar-select\"]');
+                          if (hostRadio) {
+                            const aria = [
+                              hostRadio.getAttribute('aria-checked'),
+                              hostRadio.getAttribute('aria-selected'),
+                              hostRadio.getAttribute('aria-pressed'),
+                              hostRadio.getAttribute('data-state'),
+                              hostRadio.getAttribute('data-selected'),
+                              hostRadio.getAttribute('data-checked'),
+                            ].map(v => (v || '').toLowerCase());
+                            if (aria.some(v => ['true','mixed','checked','selected','on'].includes(v))) {
+                              return true;
+                            }
+                          }
+                          if (!id) return false;
+                          const inp = document.getElementById(id);
+                          if (!inp) return false;
+                          const aria = (inp.getAttribute('aria-checked')||inp.getAttribute('aria-selected')||inp.getAttribute('aria-pressed')||'').toLowerCase();
+                          const data = (inp.getAttribute('data-state')||inp.getAttribute('data-selected')||inp.getAttribute('data-checked')||'').toLowerCase();
+                          return !!(inp.checked || inp.matches?.(':checked') || aria === 'true' || aria === 'mixed' || ['true','mixed','checked','selected','on'].includes(data));
+                        }
+                    """,
+                        lab,
+                    )
+                    if checked:
+                        return True
+            except Exception:
+                pass
 
-        # Generic guard: honor aria-pressed/aria-checked anywhere
-        try:
-            any_btn = p.locator("button[aria-label='2nd'], button:has-text('2nd')").first
-            if await any_btn.count():
-                v1 = (await any_btn.get_attribute("aria-pressed") or "").lower()
-                v2 = (await any_btn.get_attribute("aria-checked") or "").lower()
-                cls = (await any_btn.get_attribute("class") or "")
-                selected_cls = "search-reusables__multiselect-pill-button--selected" in cls
-                return v1 == "true" or v2 == "true" or selected_cls
-        except Exception:
-            pass
+            # --- D) Multiselect pill variant ---
+            try:
+                btns = p.locator(
+                    "ul.search-reusables__multiselect-pill-list button[aria-label='2nd'], "
+                    "ul.search-reusables__multiselect-pill-list button:has-text('2nd')"
+                )
+                count = await btns.count()
+                for idx in range(min(count, 3)):
+                    btn = btns.nth(idx)
+                    if not await btn.count():
+                        continue
+                    aria = (await btn.get_attribute("aria-pressed") or "").lower()
+                    if aria in ("true", "mixed"):
+                        return True
+                    aria_selected = (await btn.get_attribute("aria-selected") or "").lower()
+                    if aria_selected in ("true", "mixed"):
+                        return True
+                    cls = (await btn.get_attribute("class") or "")
+                    if "search-reusables__multiselect-pill-button--selected" in cls:
+                        return True
+            except Exception:
+                pass
 
-        return False
+            # --- E) URL state backstop (most reliable after navigation/ajax refresh) ---
+            if self._url_network_has_2nd():
+                return True
+
+            return False
+
+        if wait_ms <= 0:
+            return await _check()
+
+        deadline = time.monotonic() + (wait_ms / 1000.0)
+        while True:
+            if await _check():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                await p.wait_for_timeout(150)
+            except Exception:
+                pass
 
 
     async def _set_2nd_via_all_filters(self) -> bool:
@@ -1676,7 +1776,7 @@ class WebCrawler(SecureCookieMixin):
 
             await self.wait_network_quiet()
             # Verify using the shared verifier (which looks at pills/radios)
-            return await self._verify_connections_2nd_selected()
+            return await self._verify_connections_2nd_selected(wait_ms=1_500)
         except Exception:
             return False
 
@@ -1702,3 +1802,16 @@ class WebCrawler(SecureCookieMixin):
         except Exception:
             pass
 
+    def _url_network_has_2nd(self) -> bool:
+        try:
+            u = (self.page.url or "").lower()
+        except Exception:
+            return False
+        # LI encodes arrays & quoted enums frequently
+        patterns = [
+            'network=["s"]', 'network=%5b%22s%22%5d',
+            'facetnetwork=["s"]', 'facetnetwork=%5b%22s%22%5d',
+            # seen occasionally when state syncs differently
+            'network=s', 'facetnetwork=s'
+        ]
+        return any(p in u for p in patterns)
