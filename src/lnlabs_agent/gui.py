@@ -36,6 +36,7 @@ class App(tk.Tk):
         frm = ttk.Frame(self, padding=12)
         frm.grid(row=0, column=0, sticky="nsew")
         frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(0, weight=0)
 
         # Environment selector (shown only if multiple environments are configured)
         self.env_map = known_api_environments()
@@ -83,9 +84,17 @@ class App(tk.Tk):
 
         # Log box
         ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky="w")
-        self.log = tk.Text(frm, height=12)
-        self.log.grid(row=row + 1, column=0, columnspan=2, sticky="nsew")
+        log_container = ttk.Frame(frm)
+        log_container.grid(row=row + 1, column=0, columnspan=2, sticky="nsew")
         frm.rowconfigure(row + 1, weight=1)
+        log_container.columnconfigure(0, weight=1)
+        log_container.rowconfigure(0, weight=1)
+
+        self.log = tk.Text(log_container, wrap="word")
+        y_scroll = ttk.Scrollbar(log_container, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=y_scroll.set)
+        self.log.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
 
         # Runner
         self.runner: AgentRunner | None = None
