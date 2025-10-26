@@ -35,7 +35,81 @@ from lnlabs_agent.scraper.web_crawler import WebCrawler
 APP_NAME = "LNLabsAgent"
 VENDOR = "LNLabs"
 
-API_BASE = os.environ.get("API_BASE", "https://api.lnlabs.xyz")
+DEFAULT_PROD_API_BASE = "https://api.lnlabs.xyz"
+_API_BASE = os.environ.get("API_BASE") or DEFAULT_PROD_API_BASE
+
+# Map of environment aliases -> base URL. We keep a few synonyms for production
+# but expose only unique entries in the UI/CLI.
+_ENV_ALIAS_MAP: dict[str, str] = {
+    "prod": DEFAULT_PROD_API_BASE,
+    "production": DEFAULT_PROD_API_BASE,
+    "main": DEFAULT_PROD_API_BASE,
+}
+
+_API_BASE_DEV = os.environ.get("API_BASE_DEV")
+if _API_BASE_DEV:
+    for key in ("dev", "development", "staging", "test"):
+        _ENV_ALIAS_MAP.setdefault(key, _API_BASE_DEV)
+
+
+def get_api_base() -> str:
+    """Return the currently configured API base URL."""
+    return _API_BASE.rstrip("/")
+
+
+def configure_api_base(*, env: Optional[str] = None, override: Optional[str] = None) -> str:
+    """
+    Configure the global API base.
+    env: logical environment name (e.g., dev, prod) mapped via _ENV_ALIAS_MAP.
+    override: explicit URL string. Takes precedence over env.
+    """
+    global _API_BASE
+    if override:
+        url = override.strip()
+        if not url:
+            raise ValueError("API base override cannot be empty.")
+        _API_BASE = url
+    elif env:
+        key = env.lower()
+        if key not in _ENV_ALIAS_MAP:
+            raise ValueError(f"Unknown environment '{env}'. Available: {sorted(_ENV_ALIAS_MAP)}")
+        _API_BASE = _ENV_ALIAS_MAP[key]
+    return get_api_base()
+
+
+def known_api_environments(primary_only: bool = True) -> dict[str, str]:
+    """Return mapping of environment aliases to base URLs.
+
+    If primary_only is True (default), deduplicates aliases so only the first
+    alias for each unique URL is returned. When False, all aliases are included.
+    """
+    if not primary_only:
+        return dict(_ENV_ALIAS_MAP)
+
+    primary: dict[str, str] = {}
+    seen: set[str] = set()
+    for alias, url in _ENV_ALIAS_MAP.items():
+        norm = url.rstrip("/")
+        if norm in seen:
+            continue
+        primary[alias] = url
+        seen.add(norm)
+    return primary
+
+def _api_url(path: str) -> str:
+    base = get_api_base()
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+
+def current_api_environment(default: str = "prod") -> str:
+    """Best-effort alias describing which environment is currently active."""
+    current = get_api_base().rstrip("/")
+    for alias, url in _ENV_ALIAS_MAP.items():
+        if url.rstrip("/") == current:
+            return alias
+    return default
 
 CONF_DIR = user_config_dir(APP_NAME, VENDOR)
 TOKEN_FILE = os.path.join(CONF_DIR, "agent_token")
@@ -84,7 +158,7 @@ def pair_with_code(code: str) -> str:
     """
     Exchange a one-time pairing code (shown in the web UI) for an agent token.
     """
-    r = requests.post(f"{API_BASE}/agent/register", json={"code": code}, timeout=20)
+    r = requests.post(_api_url("/agent/register"), json={"code": code}, timeout=20)
     r.raise_for_status()
     tok = r.json()["agent_token"]
     save_token(tok)
@@ -93,7 +167,7 @@ def pair_with_code(code: str) -> str:
 def send_heartbeat(token: str) -> bool:
     try:
         r = requests.post(
-            f"{API_BASE}/agent/heartbeat",
+            _api_url("/agent/heartbeat"),
             headers={"X-Agent-Token": token},
             timeout=10,
         )
@@ -104,7 +178,7 @@ def send_heartbeat(token: str) -> bool:
 
 def next_job(token: str) -> Optional[Dict]:
     r = requests.get(
-        f"{API_BASE}/agent/jobs",
+        _api_url("/agent/jobs"),
         headers={"X-Agent-Token": token},
         timeout=30,
     )
@@ -115,7 +189,7 @@ def send_result(token: str, job_id: str, result: dict) -> None:
     """
     Robust result sender with a few retries.
     """
-    url = f"{API_BASE}/agent/result"
+    url = _api_url("/agent/result")
     payload = {"job_id": job_id, "result": result}
     headers = {"X-Agent-Token": token}
 

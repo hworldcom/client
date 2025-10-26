@@ -14,12 +14,15 @@ from tkinter import ttk, messagebox
 import traceback
 
 from lnlabs_agent.core import (
-    API_BASE,
     load_token,
     save_token,
     clear_token,
     pair_with_code,
     AgentRunner,
+    configure_api_base,
+    get_api_base,
+    known_api_environments,
+    current_api_environment,
 )
 
 class App(tk.Tk):
@@ -34,39 +37,66 @@ class App(tk.Tk):
         frm.grid(row=0, column=0, sticky="nsew")
         frm.columnconfigure(1, weight=1)
 
-        # Server label (read-only)
-        ttk.Label(frm, text="Server:").grid(row=0, column=0, sticky="w")
-        self.api_var = tk.StringVar(value=API_BASE)
-        ttk.Entry(frm, textvariable=self.api_var, state="readonly").grid(row=0, column=1, sticky="ew")
+        # Environment selector (shown only if multiple environments are configured)
+        self.env_map = known_api_environments()
+        self.env_var = tk.StringVar(value="")
+        self.env_box: ttk.Combobox | None = None
+        row = 0
+        if len(self.env_map) > 1:
+            ttk.Label(frm, text="Environment:").grid(row=row, column=0, sticky="w")
+            self.env_box = ttk.Combobox(frm, textvariable=self.env_var, state="readonly")
+            self.env_box["values"] = list(self.env_map.keys())
+            self.env_box.bind("<<ComboboxSelected>>", self.on_env_change)
+            self.env_box.grid(row=row, column=1, sticky="ew")
+            row += 1
+        else:
+            self.env_var.set(current_api_environment())
+
+        # API base display (read-only)
+        ttk.Label(frm, text="API base URL:").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        self.api_var = tk.StringVar(value=get_api_base())
+        ttk.Entry(frm, textvariable=self.api_var, state="readonly").grid(row=row, column=1, sticky="ew", pady=(6, 0))
+        row += 1
 
         # Status
-        ttk.Label(frm, text="Status:").grid(row=1, column=0, sticky="w", pady=(8,0))
+        ttk.Label(frm, text="Status:").grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.status_var = tk.StringVar(value="Not paired")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=1, column=1, sticky="w", pady=(8,0))
+        ttk.Label(frm, textvariable=self.status_var).grid(row=row, column=1, sticky="w", pady=(8, 0))
+        row += 1
 
         # Pairing code input
-        ttk.Label(frm, text="Pairing code:").grid(row=2, column=0, sticky="w", pady=(8,0))
+        ttk.Label(frm, text="Pairing code:").grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.code_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.code_var).grid(row=2, column=1, sticky="ew", pady=(8,0))
+        ttk.Entry(frm, textvariable=self.code_var).grid(row=row, column=1, sticky="ew", pady=(8, 0))
+        row += 1
 
         # Buttons
         btns = ttk.Frame(frm)
-        btns.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4,8))
+        btns.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 8))
         self.btn_pair   = ttk.Button(btns, text="Pair", command=self.on_pair)
         self.btn_unpair = ttk.Button(btns, text="Unpair", command=self.on_unpair)
         self.btn_start  = ttk.Button(btns, text="Start Agent", command=self.on_start, state="disabled")
         self.btn_stop   = ttk.Button(btns, text="Stop Agent",  command=self.on_stop,  state="disabled")
         for i, w in enumerate([self.btn_pair, self.btn_unpair, self.btn_start, self.btn_stop]):
             w.grid(row=0, column=i, padx=(0,6))
+        row += 1
 
         # Log box
-        ttk.Label(frm, text="Log:").grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, text="Log:").grid(row=row, column=0, sticky="w")
         self.log = tk.Text(frm, height=12)
-        self.log.grid(row=5, column=0, columnspan=2, sticky="nsew")
-        frm.rowconfigure(5, weight=1)
+        self.log.grid(row=row + 1, column=0, columnspan=2, sticky="nsew")
+        frm.rowconfigure(row + 1, weight=1)
 
         # Runner
         self.runner: AgentRunner | None = None
+
+        # Ensure API base reflects initial selection
+        self.refresh_api_display()
+        if self.env_box is not None:
+            current_alias = current_api_environment()
+            if current_alias in self.env_map:
+                self.env_var.set(current_alias)
+                self.env_box.set(current_alias)
 
         # Initialize from token
         if load_token():
@@ -81,12 +111,31 @@ class App(tk.Tk):
         self.log.insert("end", text + "\n")
         self.log.see("end")
 
+    def refresh_api_display(self) -> None:
+        self.api_var.set(get_api_base())
+        alias = current_api_environment()
+        self.env_var.set(alias)
+        if self.env_box is not None and alias in self.env_map:
+            self.env_box.set(alias)
+
+    def on_env_change(self, *_args) -> None:
+        env = self.env_var.get().strip()
+        if not env:
+            return
+        try:
+            configure_api_base(env=env)
+            self.refresh_api_display()
+            self.log_line(f"Environment switched to '{env}' → {get_api_base()}")
+        except ValueError as e:
+            messagebox.showerror("Environment", str(e))
+
     # ------------- actions -------------
     def on_pair(self) -> None:
         code = self.code_var.get().strip()
         if not code:
             messagebox.showwarning("Pair", "Enter the pairing code from the website.")
             return
+        self.log_line(f"Pairing using {get_api_base()}")
         try:
             tok = pair_with_code(code)
             save_token(tok)
@@ -111,6 +160,7 @@ class App(tk.Tk):
         if not tok:
             messagebox.showwarning("Start", "Not paired yet.")
             return
+        self.log_line(f"Starting agent against {get_api_base()}")
         self.runner = AgentRunner(tok, on_log=self.log_line)
         self.runner.start()
         self.status_var.set("Running")
