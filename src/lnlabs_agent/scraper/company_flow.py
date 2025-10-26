@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 from .selectors import SELECTORS, SECOND_RX, _join
 
@@ -14,13 +15,81 @@ from .selectors import SELECTORS, SECOND_RX, _join
 class CompanyFlowMixin:
     async def start_company_flow(self, company: str):
         self.log(f"[flow] company={company}")
-        await self._shot("before-search")
         names: list[str] = []
         urls: list[str] = []
-        await self._extract_data_urls_names_company(company, names, urls)
+
+        if self._looks_like_company_url(company):
+            await self._shot("before-company-url")
+            await self._extract_from_company_url(company, names, urls)
+        else:
+            await self._shot("before-search")
+            await self._extract_data_urls_names_company(company, names, urls)
+
         self.log(f"[flow] company done: {len(urls)} urls")
         await self._shot("after-company-flow")
         return names, urls
+
+    def _looks_like_company_url(self, value: str) -> bool:
+        if not value:
+            return False
+        value = value.strip()
+        if not value:
+            return False
+        if "linkedin.com" not in value.lower():
+            return False
+        # Accept scheme-less URLs
+        if value.startswith("/"):
+            return False
+        if not value.startswith("http://") and not value.startswith("https://"):
+            candidate = "https://" + value
+        else:
+            candidate = value
+        try:
+            parsed = urlparse(candidate)
+        except Exception:
+            return False
+        path = parsed.path.lower()
+        return "/company/" in path
+
+    def _normalize_company_url(self, url: str) -> str:
+        url = url.strip()
+        if not url:
+            raise ValueError("Company URL cannot be empty")
+        if url.startswith("http://"):
+            url = "https://" + url[len("http://") :]
+        elif not url.startswith("https://"):
+            url = "https://" + url
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            raise ValueError(f"Invalid company URL: {url}")
+        if "/company/" not in parsed.path.lower():
+            raise ValueError("URL does not appear to be a LinkedIn company page")
+        normalized = parsed._replace(query="", fragment="").geturl()
+        return normalized
+
+    async def _extract_from_company_url(
+        self,
+        company_url: str,
+        out_names: list[str],
+        out_urls: list[str],
+    ) -> None:
+        url = self._normalize_company_url(company_url)
+        self.log(f"[step] open company url directly -> {url}")
+        ok = await self.safe_goto(url, max_retries=3)
+        if not ok:
+            raise RuntimeError(f"Failed to load company URL: {url}")
+
+        await self.page.wait_for_load_state("domcontentloaded")
+        await self._shot("company-opened-direct")
+        await self.page.wait_for_timeout(1200)
+
+        try:
+            await self._open_company_employees()
+        except Exception as e:
+            await self._shot("company-open-employees-failed")
+            raise
+
+        await self._scrape_company_employees(out_names, out_urls)
 
     async def _go_home(self) -> None:
         p = self.page
@@ -102,6 +171,9 @@ class CompanyFlowMixin:
         await self.page.wait_for_timeout(1200)
         self.log("[step] open employees")
         await self._open_company_employees()
+        await self._scrape_company_employees(out_names, out_urls)
+
+    async def _scrape_company_employees(self, out_names: list[str], out_urls: list[str]) -> None:
         await self.page.wait_for_timeout(5000)
 
         self.log("[step] filter 2nd-degree (simple toolbar click)]")

@@ -421,13 +421,14 @@ class BaseWebCrawler(SecureCookieMixin):
 
     # ------------------------ Navigation primitives ------------------------
 
-    async def safe_goto(self, url: str, max_retries: int = 3) -> bool:
+    async def _goto_core(self, url: str, max_retries: int, allow_feed_redirect: bool) -> bool:
         assert self.page
         for attempt in range(max_retries):
             try:
                 await self.page.goto(url, timeout=10_000)
                 await self.page.wait_for_load_state("domcontentloaded")
-                if "linkedin.com/feed" in (self.page.url or "") and "feed" not in url:
+                current_url = self.page.url or ""
+                if (not allow_feed_redirect and "linkedin.com/feed" in current_url and "feed" not in url):
                     self.log("[nav] redirected to feed; retrying …]")
                     await asyncio.sleep(0.6 + attempt * 0.4)
                     continue
@@ -436,6 +437,12 @@ class BaseWebCrawler(SecureCookieMixin):
                 self.log(f"[nav] error loading {url} (attempt {attempt+1}): {e}")
             await asyncio.sleep(0.8 + attempt * 0.6)
         return False
+
+    async def safe_goto(self, url: str, max_retries: int = 3) -> bool:
+        return await self._goto_core(url, max_retries, allow_feed_redirect=False)
+
+    async def goto_allow_feed_redirect(self, url: str, max_retries: int = 3) -> bool:
+        return await self._goto_core(url, max_retries, allow_feed_redirect=True)
 
     async def wait_for_any(self, selectors: List[str], timeout: int = 15_000) -> str:
         assert self.page
@@ -1156,5 +1163,3 @@ class BaseWebCrawler(SecureCookieMixin):
                 await p.wait_for_timeout(150)
             except Exception:
                 pass
-
-
