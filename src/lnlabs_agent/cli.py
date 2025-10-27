@@ -22,6 +22,7 @@ from lnlabs_agent.core import (
     configure_api_base,
     get_api_base,
     known_api_environments,
+    cleanup_artifacts_dir,
 )
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -79,6 +80,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         _shutdown()
         runner.join()
+    finally:
+        cleanup_artifacts_dir()
     return 0
 
 if __name__ == "__main__":

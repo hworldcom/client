@@ -24,6 +24,7 @@ from lnlabs_agent.core import (
     get_api_base,
     known_api_environments,
     current_api_environment,
+    cleanup_artifacts_dir,
 )
 
 class App(tk.Tk):
@@ -196,6 +197,7 @@ class App(tk.Tk):
         else:
             self.status_var.set("Not paired")
             self.btn_start.config(state="disabled")
+        cleanup_artifacts_dir(self.log_line)
         self.btn_stop.config(state="disabled")
 
     def on_close(self) -> None:

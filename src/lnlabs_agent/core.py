@@ -20,6 +20,7 @@ import threading
 import sys
 import tempfile
 import zipfile
+import shutil
 import uuid
 from collections import deque
 from typing import Callable, Optional, Dict, List, Any
@@ -249,6 +250,31 @@ def send_diagnostic_report(
     except Exception as exc:
         print(f"[diagnostic] exception while uploading: {exc}")
 
+
+def cleanup_artifacts_dir(logger: Optional[Callable[[str], None]] = None) -> None:
+    """
+    Remove per-job artifact directories and screenshots so future runs start clean.
+    """
+    path = Path(ARTIFACTS_DIR)
+    if not path.exists():
+        return
+
+    try:
+        for child in path.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+            except Exception as exc:
+                if logger:
+                    logger(f"[artifacts] cleanup error for {child}: {exc}")
+        path.mkdir(parents=True, exist_ok=True)
+        if logger:
+            logger(f"[artifacts] cleared {path}")
+    except Exception as exc:
+        if logger:
+            logger(f"[artifacts] cleanup failed: {exc}")
 
 def _safe_slug(text: str, fallback: str = "item") -> str:
     slug = "".join(ch if ch.isalnum() else "-" for ch in text)
