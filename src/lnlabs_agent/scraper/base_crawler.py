@@ -13,6 +13,12 @@ from platformdirs import user_log_dir, user_config_dir
 from lnlabs_agent.secure_cookies import SecureCookieMixin
 from .selectors import SELECTORS, SECOND_RX, _join, _ms
 
+
+def _slugify_artifact_label(label: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", label or "")
+    cleaned = cleaned.strip("-")
+    return (cleaned or "artifact")[:48]
+
 # ------------------------ Crawler ------------------------
 
 class BaseWebCrawler(SecureCookieMixin):
@@ -52,6 +58,7 @@ class BaseWebCrawler(SecureCookieMixin):
         # screenshots / small artifacts
         self.artifacts_dir = Path(artifacts_dir or (app_conf / "artifacts"))
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.diagnostic_paths: list[Path] = []
 
         # file audit log (blocked/failed requests, filtered console)
         default_dir = Path(user_log_dir("LNLabsAgent", "LNLabs"))
@@ -119,8 +126,45 @@ class BaseWebCrawler(SecureCookieMixin):
             if self.page:
                 await self.page.screenshot(path=str(path), full_page=False)
                 self.log(f"[shot] {path}")
+                self._record_artifact(path)
         except Exception as e:
             self.log(f"[shot] failed: {e}")
+
+    def _record_artifact(self, path: Path) -> None:
+        try:
+            self.diagnostic_paths.append(path)
+        except Exception:
+            pass
+
+    async def dump_dom(self, label: str) -> Optional[Path]:
+        """
+        Persist the current DOM to a file for diagnostics.
+        """
+        if not self.page:
+            return None
+        safe = _slugify_artifact_label(label)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        path = self.artifacts_dir / f"{ts}-{safe}.html"
+        try:
+            html = await self.page.content()
+            path.write_text(html, encoding="utf-8")
+            self._record_artifact(path)
+            self.log(f"[dom] saved {path}")
+            return path
+        except Exception as exc:
+            self.log(f"[dom] dump failed: {exc}")
+            return None
+
+    async def capture_failure_artifacts(self, label: str) -> None:
+        """
+        Capture a screenshot and DOM snapshot for diagnostics when a step fails.
+        """
+        safe = _slugify_artifact_label(label)
+        try:
+            await self._shot(f"failure-{safe}")
+        except Exception as exc:
+            self.log(f"[diag] shot failed: {exc}")
+        await self.dump_dom(f"failure-{safe}")
 
     # ------------------------ Session helpers ------------------------
 

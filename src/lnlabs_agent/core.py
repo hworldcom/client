@@ -18,7 +18,11 @@ import json
 import time
 import threading
 import sys
-from typing import Callable, Optional, Dict, List
+import tempfile
+import zipfile
+import uuid
+from collections import deque
+from typing import Callable, Optional, Dict, List, Any
 
 import asyncio
 import platform
@@ -128,6 +132,7 @@ os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
 HEARTBEAT_SEC = 10
 JOB_IDLE_SEC = 2
+LOG_HISTORY_LIMIT = 2000
 
 # -------------------------
 # Token storage
@@ -211,6 +216,72 @@ def send_result(token: str, job_id: str, result: dict) -> None:
         raise last_exc
     else:
         raise RuntimeError(f"send_result failed: {r.status_code} {r.text[:500]}")
+
+
+def send_diagnostic_report(
+    token: str,
+    *,
+    job_id: str,
+    mode: str,
+    urls: List[str],
+    summary: str,
+    bundle_path: Path,
+) -> None:
+    """
+    Upload a diagnostic bundle (zip) to the backend so the server can notify developers.
+    """
+    url = _api_url("/agent/report")
+    headers = {"X-Agent-Token": token}
+    data = {
+        "job_id": job_id,
+        "mode": mode,
+        "summary": summary,
+        "urls": json.dumps(urls),
+    }
+
+    try:
+        with bundle_path.open("rb") as fh:
+            files = {"bundle": (bundle_path.name, fh, "application/zip")}
+            r = requests.post(url, data=data, files=files, headers=headers, timeout=60)
+            if 200 <= r.status_code < 300:
+                return
+            print(f"[diagnostic] upload failed: {r.status_code} {r.text[:500]}")
+    except Exception as exc:
+        print(f"[diagnostic] exception while uploading: {exc}")
+
+
+def _safe_slug(text: str, fallback: str = "item") -> str:
+    slug = "".join(ch if ch.isalnum() else "-" for ch in text)
+    slug = "-".join(part for part in slug.split("-") if part)
+    slug = slug[:40]
+    return slug or fallback
+
+
+def _write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _build_diagnostic_bundle(job_dir: Path, metadata: Dict[str, Any], log_lines: List[str]) -> Optional[Path]:
+    """
+    Persist metadata & logs into the job directory and return a zipped archive path.
+    """
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _write_text(job_dir / "metadata.json", json.dumps(metadata, indent=2))
+        _write_text(job_dir / "agent.log", "\n".join(log_lines))
+
+        bundle_path = Path(
+            tempfile.gettempdir()
+        ) / f"lnlabs-report-{metadata.get('job_id','unknown')}-{uuid.uuid4().hex}.zip"
+        with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in job_dir.rglob("*"):
+                if item.is_file():
+                    zf.write(item, arcname=item.relative_to(job_dir))
+        return bundle_path
+    except Exception as exc:
+        print(f"[diagnostic] could not build bundle: {exc}")
+        return None
 
 # -------------------------
 # Playwright bootstrap
@@ -297,15 +368,71 @@ class AgentRunner(threading.Thread):
         self.token = token
         self.on_log = on_log or (lambda s: None)
         self._stop_evt = threading.Event()
+        self._log_history: deque[str] = deque(maxlen=LOG_HISTORY_LIMIT)
 
     def stop(self) -> None:
         self._stop_evt.set()
 
     def log(self, msg: str) -> None:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"{ts} {msg}"
+        self._log_history.append(entry)
         try:
             self.on_log(msg)
         except Exception:
             pass
+
+    def _log_snapshot(self) -> List[str]:
+        return list(self._log_history)
+
+    def _create_job_dir(self, job_id: str) -> Path:
+        safe_job = _safe_slug(job_id or "job", fallback="job")
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        job_dir = Path(ARTIFACTS_DIR) / safe_job / ts
+        job_dir.mkdir(parents=True, exist_ok=True)
+        return job_dir
+
+    def _submit_diagnostics(
+        self,
+        *,
+        job_id: str,
+        mode: str,
+        urls: List[str],
+        issues: List[Dict[str, Any]],
+        job_dir: Path,
+    ) -> None:
+        if not issues:
+            return
+
+        metadata: Dict[str, Any] = {
+            "job_id": job_id,
+            "mode": mode,
+            "urls": urls,
+            "issues": issues,
+            "log_entries": len(self._log_history),
+            "created_at": int(time.time()),
+        }
+        bundle = _build_diagnostic_bundle(job_dir, metadata, self._log_snapshot())
+        if not bundle:
+            self.log(f"[diagnostic] skipped for job {job_id} (bundle build failed)")
+            return
+
+        summary = "; ".join(f"{issue.get('item')}: {issue.get('error')}" for issue in issues)
+        try:
+            send_diagnostic_report(
+                self.token,
+                job_id=job_id,
+                mode=mode,
+                urls=urls,
+                summary=summary,
+                bundle_path=bundle,
+            )
+            self.log(f"[diagnostic] report sent for job {job_id}")
+        finally:
+            try:
+                bundle.unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
 
     def run(self) -> None:
         last_hb = 0.0
@@ -325,9 +452,9 @@ class AgentRunner(threading.Thread):
                     time.sleep(JOB_IDLE_SEC)
                     continue
 
-                job_id = job.get("id")
-                urls   = job.get("urls") or []
-                mode   = (job.get("mode") or "profiles").lower()
+                job_id = str(job.get("id") or uuid.uuid4().hex)
+                urls = [str(u) for u in (job.get("urls") or [])]
+                mode = (job.get("mode") or "profiles").lower()
                 limit_raw = job.get("limit")
                 limit = None
                 if limit_raw is not None:
@@ -338,49 +465,80 @@ class AgentRunner(threading.Thread):
                 limit_note = f", limit={limit}" if limit is not None else ""
                 self.log(f"Job {job_id} received mode={mode} ({len(urls)} items{limit_note})")
 
-                if mode == "companies":
-                    # Ensure chromium is installed in our managed cache
-                    ensure_playwright_chromium_installed(self.log)
+                job_dir = self._create_job_dir(job_id)
+                issues: List[Dict[str, Any]] = []
 
-                    # If still not present, fail the job gracefully
-                    chromium_exe = _chromium_exe_from_cache(BROWSERS_DIR)
-                    if not chromium_exe:
-                        raise RuntimeError(
-                            "Chromium was not found after install. Check network/proxy and try again. "
-                            f"Browsers dir: {BROWSERS_DIR}"
+                try:
+                    if mode == "companies":
+                        ensure_playwright_chromium_installed(self.log)
+                        chromium_exe = _chromium_exe_from_cache(BROWSERS_DIR)
+                        if not chromium_exe:
+                            raise RuntimeError(
+                                "Chromium was not found after install. Check network/proxy and try again. "
+                                f"Browsers dir: {BROWSERS_DIR}"
+                            )
+                        result, flow_issues = asyncio.run(self._companies_flow(job_id, urls, job_dir))
+                    else:
+                        result, flow_issues = asyncio.run(
+                            self._profiles_flow(job_id, urls, job_dir, limit=limit)
                         )
+                    if flow_issues:
+                        issues.extend(flow_issues)
 
-                    # Run the scraping flow in an async context-managed session
-                    result = asyncio.run(self._companies_flow(urls))
-                else:
-                    result = asyncio.run(self._profiles_flow(urls, limit=limit))
+                    self.log(f"[job {job_id}] sending result …")
+                    send_result(self.token, job_id, result)
+                    self.log(f"[job {job_id}] result sent ✅")
 
-                self.log(f"[job {job_id}] sending result …")
-                send_result(self.token, job_id, result)
-                self.log(f"[job {job_id}] result sent ✅")
+                except Exception as e:
+                    err_msg = str(e)
+                    issue: Dict[str, Any] = {"item": "job", "error": err_msg}
+                    try:
+                        import traceback as _traceback  # local import to avoid top-level dependency if unused
 
+                        issue["traceback"] = _traceback.format_exc()
+                    except Exception:
+                        pass
+                    issues.append(issue)
+                    try:
+                        self.log(f"[job {job_id}] error: {err_msg} — sending failure result")
+                    except Exception:
+                        self.log(f"[job] error before job_id known: {err_msg}")
+                    fail = {"error": err_msg, "ok": False}
+                    try:
+                        send_result(self.token, job_id, fail)  # type: ignore[arg-type]
+                        self.log(f"[job {job_id}] failure result sent ❌")
+                    except Exception as e2:
+                        self.log(f"[job {job_id}] could not send failure result: {e2}")
+                finally:
+                    try:
+                        self._submit_diagnostics(
+                            job_id=job_id,
+                            mode=mode,
+                            urls=urls,
+                            issues=issues,
+                            job_dir=job_dir,
+                        )
+                    except Exception as diag_exc:
+                        self.log(f"[diagnostic] failed to submit for job {job_id}: {diag_exc}")
             except Exception as e:
-                # best-effort error result so the job completes visibly
-                try:
-                    self.log(f"[job {job_id}] error: {e} — sending failure result")
-                except Exception:
-                    self.log(f"[job] error before job_id known: {e}")
-                fail = {"error": str(e), "ok": False}
-                try:
-                    send_result(self.token, job_id, fail)  # type: ignore[arg-type]
-                    self.log(f"[job {job_id}] failure result sent ❌")
-                except Exception as e2:
-                    self.log(f"[job {job_id}] could not send failure result: {e2}")
+                self.log(f"[runner] unexpected error while polling jobs: {e}")
+                time.sleep(2)
 
     # ---- async sub-flow for companies mode ----
-    async def _companies_flow(self, urls: list[str]) -> dict:
+    async def _companies_flow(
+        self,
+        job_id: str,
+        urls: list[str],
+        job_dir: Path,
+    ) -> tuple[dict[str, dict], List[Dict[str, Any]]]:
         """
         One job = one browser session. Guarantees teardown via `async with`.
         """
         result: dict[str, dict] = {}
+        issues: List[Dict[str, Any]] = []
         crawler = WebCrawler(
             logger=self.log,
-            artifacts_dir=ARTIFACTS_DIR,
+            artifacts_dir=str(job_dir),
             cookie_file=COOKIE_FILE,
             # You can pass browser_exe if you want to force a specific binary:
             # browser_exe=_chromium_exe_from_cache(BROWSERS_DIR),
@@ -392,18 +550,31 @@ class AgentRunner(threading.Thread):
                     names, links = await crawler.start_company_flow(comp)
                     result[comp] = {"employees": links, "count": len(links)}
                 except Exception as e:
-                    self.log(f"[job] company={comp} error: {e}")
-                    result[comp] = {"error": str(e), "employees": []}
-        return result
+                    err_msg = str(e)
+                    self.log(f"[job] company={comp} error: {err_msg}")
+                    issues.append({"item": comp, "error": err_msg})
+                    try:
+                        await crawler.capture_failure_artifacts(f"{job_id}-company-{comp}")
+                    except Exception as diag_exc:
+                        self.log(f"[diagnostic] capture failure (company) {comp}: {diag_exc}")
+                    result[comp] = {"error": err_msg, "employees": []}
+        return result, issues
 
-    async def _profiles_flow(self, urls: list[str], limit: Optional[int] = None) -> dict:
+    async def _profiles_flow(
+        self,
+        job_id: str,
+        urls: list[str],
+        job_dir: Path,
+        limit: Optional[int] = None,
+    ) -> tuple[dict[str, dict], List[Dict[str, Any]]]:
         """
         Scrape mutual connections for each profile URL supplied.
         """
         result: dict[str, dict] = {}
+        issues: List[Dict[str, Any]] = []
         crawler = WebCrawler(
             logger=self.log,
-            artifacts_dir=ARTIFACTS_DIR,
+            artifacts_dir=str(job_dir),
             cookie_file=COOKIE_FILE,
         )
         async with crawler.session(headless=False):
@@ -416,6 +587,12 @@ class AgentRunner(threading.Thread):
                         "count": len(connections),
                     }
                 except Exception as e:
-                    self.log(f"[job] profile={profile} error: {e}")
-                    result[profile] = {"error": str(e), "connections": []}
-        return result
+                    err_msg = str(e)
+                    self.log(f"[job] profile={profile} error: {err_msg}")
+                    issues.append({"item": profile, "error": err_msg})
+                    try:
+                        await crawler.capture_failure_artifacts(f"{job_id}-profile-{profile}")
+                    except Exception as diag_exc:
+                        self.log(f"[diagnostic] capture failure (profile) {profile}: {diag_exc}")
+                    result[profile] = {"error": err_msg, "connections": []}
+        return result, issues
