@@ -9,6 +9,7 @@ Package with PyInstaller using --windowed / -w to get a double-clickable app.
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 import traceback
@@ -117,8 +118,14 @@ class App(tk.Tk):
 
     # ------------- helpers -------------
     def log_line(self, text: str) -> None:
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
+        def _append() -> None:
+            self.log.insert("end", text + "\n")
+            self.log.see("end")
+
+        if threading.current_thread() is threading.main_thread():
+            _append()
+        else:
+            self.log.after(0, _append)
 
     def refresh_api_display(self) -> None:
         self.api_var.set(get_api_base())

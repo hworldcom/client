@@ -17,10 +17,12 @@ import os
 import json
 import time
 import threading
+import sys
 from typing import Callable, Optional, Dict, List
 
 import asyncio
 import platform
+import subprocess
 from pathlib import Path
 
 import requests
@@ -116,7 +118,7 @@ TOKEN_FILE = os.path.join(CONF_DIR, "agent_token")
 COOKIE_FILE = os.path.join(CONF_DIR, "linkedin_cookies.json")
 
 # Where Playwright should put its browser binaries (per-user cache)
-BROWSERS_DIR = os.path.join(CONF_DIR, "pw-browsers")
+BROWSERS_DIR = os.environ.get("LNLABS_BROWSERS_DIR") or os.path.join(CONF_DIR, "pw-browsers")
 os.makedirs(BROWSERS_DIR, exist_ok=True)
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", BROWSERS_DIR)
 
@@ -227,15 +229,27 @@ def ensure_playwright_chromium_installed(log: Callable[[str], None]) -> None:
 
     try:
         log("Ensuring Playwright Chromium is installed…")
-        # Use the Playwright CLI programmatically
-        from playwright.__main__ import main as pw_main
-        import sys as _sys
-        old = list(_sys.argv)
-        try:
-            _sys.argv = ["playwright", "install", "chromium"]
-            pw_main()
-        finally:
-            _sys.argv = old
+        from playwright._impl._driver import compute_driver_executable
+
+        node_path, cli_path = compute_driver_executable()
+        cmd = [node_path, cli_path, "install", "chromium"]
+        log(f"[playwright] running: {' '.join(cmd)}")
+
+        with subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ},
+        ) as proc:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if line:
+                    log(f"[playwright] {line}")
+            code = proc.wait()
+            if code != 0:
+                raise RuntimeError(f"Playwright install exited with code {code}")
     except Exception as e:
         log(f"Playwright install failed: {e}")
 
