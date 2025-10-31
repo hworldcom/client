@@ -468,9 +468,9 @@ class BaseWebCrawler(SecureCookieMixin):
     async def _goto_core(self, url: str, max_retries: int, allow_feed_redirect: bool) -> bool:
         assert self.page
         for attempt in range(max_retries):
+            timeout_ms = 12_000 + attempt * 4_000
             try:
-                await self.page.goto(url, timeout=10_000)
-                await self.page.wait_for_load_state("domcontentloaded")
+                await self.page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
                 current_url = self.page.url or ""
                 if (not allow_feed_redirect and "linkedin.com/feed" in current_url and "feed" not in url):
                     self.log("[nav] redirected to feed; retrying …]")
@@ -478,7 +478,15 @@ class BaseWebCrawler(SecureCookieMixin):
                     continue
                 return True
             except Exception as e:
+                current_url = self.page.url or ""
+                if current_url and current_url.rstrip("/") == url.rstrip("/"):
+                    self.log(f"[nav] timeout but landed on {current_url}, continuing")
+                    return True
                 self.log(f"[nav] error loading {url} (attempt {attempt+1}): {e}")
+                try:
+                    await self._shot(f"goto-failed-{attempt+1}")
+                except Exception:
+                    pass
             await asyncio.sleep(0.8 + attempt * 0.6)
         return False
 

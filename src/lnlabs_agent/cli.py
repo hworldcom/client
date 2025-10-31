@@ -13,6 +13,7 @@ import signal
 import sys
 from typing import Optional
 
+from lnlabs_agent import __version__
 from lnlabs_agent.core import (
     pair_with_code,
     load_token,
@@ -37,6 +38,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--api-base", help="Override API base URL (e.g., https://lnlabs-backend.dev.run.app)")
     ap.add_argument("--show-api-base", action="store_true", help="Print the resolved API base and exit")
     args = ap.parse_args(argv)
+
+    print(f"LNLabs Agent v{__version__}")
 
     try:
         configure_api_base(env=args.env, override=args.api_base)

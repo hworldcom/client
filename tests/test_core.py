@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from lnlabs_agent import core
+from lnlabs_agent import core, __version__
 
 
 def test_cleanup_artifacts_dir_removes_contents(tmp_path, monkeypatch):

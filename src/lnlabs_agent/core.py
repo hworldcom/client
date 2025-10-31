@@ -32,6 +32,7 @@ from pathlib import Path
 
 import requests
 from platformdirs import user_config_dir
+from lnlabs_agent import __version__
 
 # Playwright scraper
 from lnlabs_agent.scraper.web_crawler import WebCrawler
@@ -227,6 +228,7 @@ def send_diagnostic_report(
     urls: List[str],
     summary: str,
     bundle_path: Path,
+    version: str,
 ) -> None:
     """
     Upload a diagnostic bundle (zip) to the backend so the server can notify developers.
@@ -238,6 +240,7 @@ def send_diagnostic_report(
         "mode": mode,
         "summary": summary,
         "urls": json.dumps(urls),
+        "version": version,
     }
 
     try:
@@ -437,6 +440,7 @@ class AgentRunner(threading.Thread):
             "issues": issues,
             "log_entries": len(self._log_history),
             "created_at": int(time.time()),
+            "version": __version__,
         }
         bundle = _build_diagnostic_bundle(job_dir, metadata, self._log_snapshot())
         if not bundle:
@@ -452,6 +456,7 @@ class AgentRunner(threading.Thread):
                 urls=urls,
                 summary=summary,
                 bundle_path=bundle,
+                version=__version__,
             )
             self.log(f"[diagnostic] report sent for job {job_id}")
         finally:

@@ -14,6 +14,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import traceback
 
+from lnlabs_agent import __version__
 from lnlabs_agent.core import (
     load_token,
     save_token,
@@ -30,7 +31,7 @@ from lnlabs_agent.core import (
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("LNLabs Agent")
+        self.title(f"LNLabs Agent v{__version__}")
         self.minsize(460, 380)
 
         # Layout base
@@ -62,6 +63,10 @@ class App(tk.Tk):
         row += 1
 
         # Status
+        ttk.Label(frm, text="Version:").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text=f"v{__version__}").grid(row=row, column=1, sticky="w", pady=(6, 0))
+        row += 1
+
         ttk.Label(frm, text="Status:").grid(row=row, column=0, sticky="w", pady=(8, 0))
         self.status_var = tk.StringVar(value="Not paired")
         ttk.Label(frm, textvariable=self.status_var).grid(row=row, column=1, sticky="w", pady=(8, 0))
